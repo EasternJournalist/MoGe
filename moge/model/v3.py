@@ -18,7 +18,6 @@ class MoGeModel(MoGeModelV2):
         points_head: Dict[str, Any] = None,
         mask_head: Dict[str, Any] = None,
         normal_head: Dict[str, Any] = None,
-        uncertainty_head: Dict[str, Any] = None,
         scale_head: Dict[str, Any] = None,
         remap_output: Literal['linear', 'sinh', 'exp', 'sinh_exp'] = 'linear',
         num_tokens_range: List[int] = [1200, 3600],
@@ -32,7 +31,6 @@ class MoGeModel(MoGeModelV2):
             points_head=points_head,
             mask_head=mask_head,
             normal_head=normal_head,
-            uncertainty_head=uncertainty_head,
             scale_head=scale_head,
             remap_output=remap_output,
             num_tokens_range=num_tokens_range,
@@ -167,18 +165,18 @@ class MoGeModel(MoGeModelV2):
 
         raw_points = self.points_head(neck_features)[-1] if hasattr(self, 'points_head') else None
         # infer_fast consumes only points + metric_scale, so it passes points_only=True to skip
-        # the normal/mask/uncertainty heads and their full-res upsampling (pure waste there).
+        # the normal/mask heads and their full-res upsampling (pure waste there).
         if points_only:
-            normal = mask = uncertainty = None
+            normal = mask  = None
         else:
-            normal, mask, uncertainty = (
+            normal, mask = (
                 getattr(self, head)(neck_features)[-1] if hasattr(self, head) else None
-                for head in ['normal_head', 'mask_head', 'uncertainty_head']
+                for head in ['normal_head', 'mask_head']
             )
         metric_scale = self.scale_head(cls_token) if hasattr(self, 'scale_head') else None
 
         resize_fn = lambda x: F.interpolate(x, (img_h, img_w), mode='bilinear', align_corners=False, antialias=False)
-        normal, mask, uncertainty = (resize_fn(x) if x is not None else None for x in [normal, mask, uncertainty])
+        normal, mask = (resize_fn(x) if x is not None else None for x in [normal, mask])
 
         def postprocess_points(points: torch.Tensor, hwc: bool, resize: bool) -> torch.Tensor:
             # input is BHW3 or B3HW at (x/z, y/z, logz). Output is BHW3 at (x, y, z).
@@ -222,8 +220,6 @@ class MoGeModel(MoGeModelV2):
             normal = F.normalize(normal, dim=-1)
         if mask is not None:
             mask = mask.squeeze(1).sigmoid()
-        if uncertainty is not None:
-            uncertainty = uncertainty.squeeze(1).exp()
         if metric_scale is not None:
             metric_scale = metric_scale.squeeze(1).exp()
 
@@ -232,7 +228,6 @@ class MoGeModel(MoGeModelV2):
             'delta_z_all': delta_z_all if len(delta_z_all) > 0 else None,
             'normal': normal,
             'mask': mask,
-            'uncertainty': uncertainty,
             'metric_scale': metric_scale,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
@@ -278,7 +273,7 @@ class MoGeModel(MoGeModelV2):
             dtype = torch.bfloat16
         with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=dtype is not None):
             output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps)
-        points_all, normal, mask, uncertainty, metric_scale = (output.get(k, None) for k in ['points_all', 'normal', 'mask', 'uncertainty', 'metric_scale'])
+        points_all, normal, mask, metric_scale = (output.get(k, None) for k in ['points_all', 'normal', 'mask', 'metric_scale'])
 
         points_all = [p.float() for p in points_all] if points_all is not None else None
         normal, mask, metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [normal, mask, metric_scale, fov_x])
@@ -365,7 +360,6 @@ class MoGeModel(MoGeModelV2):
             'depth': depth,
             'depth_all': depth_all,
             'mask': mask_binary,
-            'uncertainty': uncertainty,
             'normal': normal,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
