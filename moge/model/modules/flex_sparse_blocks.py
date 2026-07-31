@@ -84,14 +84,13 @@ class PointwiseBlock(nn.Module):
 
 class SparseResBlock3d(nn.Module):
     def __init__(self, channels: int, out_channels: int = None,
-                 norm: bool = True, activation: Literal["silu", "relu"] = "silu", norm2: bool = False):
+                 norm: bool = True, activation: Literal["silu", "relu"] = "silu"):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
         self.use_checkpoint = False
 
         self.norm1 = nn.LayerNorm(channels, elementwise_affine=True, eps=1e-6) if norm else nn.Identity()
-        self.norm2 = nn.LayerNorm(self.out_channels, elementwise_affine=False, eps=1e-6) if (norm and norm2) else nn.Identity()
         self.activation_fn = F.silu if activation == "silu" else F.relu
 
         self.conv1 = make_conv3d(channels, self.out_channels)
@@ -104,7 +103,7 @@ class SparseResBlock3d(nn.Module):
     def _forward(self, feats, coords, shape, neighbor_cache=None):
         h = self.activation_fn(self.norm1(feats).type_as(feats))
         h, neighbor_cache = self.conv1(h, coords, shape, neighbor_cache=neighbor_cache)
-        h = self.activation_fn(self.norm2(h).type_as(h))
+        h = self.activation_fn(h)
         h, neighbor_cache = self.conv2(h, coords, shape, neighbor_cache=neighbor_cache)
         return h + self.skip_connection(feats), neighbor_cache
 
