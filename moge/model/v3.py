@@ -42,9 +42,7 @@ class MoGeModel(MoGeModelV2):
         if refiner is not None:
             refiner_cfg = dict(refiner)
             self.refiner_depth_resolution: float = refiner_cfg.pop('depth_resolution', 256)
-            self.refiner_add_uv: bool = refiner_cfg.pop('add_uv', True)
-            in_channels = 3 if self.refiner_add_uv else 1
-            self.refiner = Sparse3DUNet(in_channels=in_channels, out_channels=1, **refiner_cfg)
+            self.refiner = Sparse3DUNet(in_channels=3, out_channels=1, **refiner_cfg)
         else:
             print("Warning: refiner is not initialized.")
 
@@ -97,11 +95,8 @@ class MoGeModel(MoGeModelV2):
         batch = torch.arange(bsz, device=device, dtype=torch.long).view(bsz, 1, 1).expand(bsz, height, width)
 
         coords = torch.stack([batch, i, j, z_idx], dim=-1).reshape(-1, 4).to(torch.int32)
-        if self.refiner_add_uv:
-            uv = shared_uv.unsqueeze(0).expand(bsz, -1, -1, -1)
-            feats = torch.cat([uv, logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
-        else:
-            feats = logz.reshape(-1, 1)
+        uv = shared_uv.unsqueeze(0).expand(bsz, -1, -1, -1)
+        feats = torch.cat([uv, logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
         shape = torch.Size([bsz, height, width, z_extent, feats.shape[-1]])
         return feats, coords, shape, logz
 
