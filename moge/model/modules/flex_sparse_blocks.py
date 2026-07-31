@@ -31,6 +31,13 @@ def _pick_spconv_algorithm(in_channels: int, out_channels: int) -> str:
     return "implicit_gemm"
 
 
+def make_conv3d(in_channels: int, out_channels: int, kernel_size: int = 3) -> SubmanifoldConv3d:
+    return SubmanifoldConv3d(
+        in_channels, out_channels, kernel_size,
+        algorithm=_pick_spconv_algorithm(in_channels, out_channels),
+    )
+
+
 def get_activation(activation: Literal["relu", "silu"]) -> nn.Module:
     if activation == "relu":
         return nn.ReLU()
@@ -87,17 +94,14 @@ class SparseResBlock3d(nn.Module):
         self.norm2 = nn.LayerNorm(self.out_channels, elementwise_affine=False, eps=1e-6) if (norm and norm2) else nn.Identity()
         self.activation_fn = F.silu if activation == "silu" else F.relu
 
-        self.conv1 = SubmanifoldConv3d(channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(channels, self.out_channels))
-        self.conv2 = zero_module(SubmanifoldConv3d(self.out_channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(self.out_channels, self.out_channels)))
+        self.conv1 = make_conv3d(channels, self.out_channels)
+        self.conv2 = zero_module(make_conv3d(self.out_channels, self.out_channels))
         self.skip_connection = (
             nn.Linear(channels, self.out_channels)
             if channels != self.out_channels else nn.Identity()
         )
 
     def _forward(self, feats, coords, shape, neighbor_cache=None):
-        # Cast LN outputs back to the input dtype so the following SiLU/conv
-        # stay in the autocast dtype (LN itself is autocast-promoted to fp32
-        # for numerical stability).
         h = self.activation_fn(self.norm1(feats).type_as(feats))
         h, neighbor_cache = self.conv1(h, coords, shape, neighbor_cache=neighbor_cache)
         h = self.activation_fn(self.norm2(h).type_as(h))
@@ -127,8 +131,8 @@ class SparseResBlockDownsample3d(nn.Module):
         self.norm2 = nn.LayerNorm(self.out_channels, elementwise_affine=False, eps=1e-6) if norm else nn.Identity()
         self.activation_fn = F.silu if activation == "silu" else F.relu
 
-        self.conv1 = SubmanifoldConv3d(channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(channels, self.out_channels))
-        self.conv2 = zero_module(SubmanifoldConv3d(self.out_channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(self.out_channels, self.out_channels)))
+        self.conv1 = make_conv3d(channels, self.out_channels)
+        self.conv2 = zero_module(make_conv3d(self.out_channels, self.out_channels))
         self.skip_connection = (
             nn.Linear(channels, self.out_channels)
             if channels != self.out_channels else nn.Identity()
@@ -179,8 +183,8 @@ class SparseResBlockUpsample3d(nn.Module):
         self.norm2 = nn.LayerNorm(self.out_channels, elementwise_affine=False, eps=1e-6) if norm else nn.Identity()
         self.activation_fn = F.silu if activation == "silu" else F.relu
 
-        self.conv1 = SubmanifoldConv3d(channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(channels, self.out_channels))
-        self.conv2 = zero_module(SubmanifoldConv3d(self.out_channels, self.out_channels, 3, algorithm=_pick_spconv_algorithm(self.out_channels, self.out_channels)))
+        self.conv1 = make_conv3d(channels, self.out_channels)
+        self.conv2 = zero_module(make_conv3d(self.out_channels, self.out_channels))
         self.skip_connection = (
             nn.Linear(channels, self.out_channels)
             if channels != self.out_channels else nn.Identity()
@@ -283,10 +287,6 @@ class NearestUp(nn.Module):
         self.linear = nn.Linear(in_ch, out_ch)
 
     def forward(self, feats, coords, shape, target_coords, target_shape, up_cache=None):
-        # Apply the channel projection BEFORE nearest-neighbor upsampling: this
-        # is mathematically identical (nearest upsample is a pure gather, which
-        # commutes with any per-point linear map) but the linear runs on the
-        # smaller input point set instead of the larger upsampled one.
         feats = self.linear(feats)
         shape = _with_channels(shape, feats.shape[-1])
         feats, coords, shape, _ = self.upsample(
