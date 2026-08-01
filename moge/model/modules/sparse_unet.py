@@ -18,28 +18,6 @@ from .flex_sparse_blocks import (
 from flex_gemm.ops import NeighborCache
 
 
-# Deprecated `sample_type` aliases -> canonical names. This UNet has no
-# resblock resampling variant. `'spatial2channel_xy'` is dropped (no caller).
-_DEPRECATED_SAMPLE_TYPES = {
-    'pool': 'pool-nearest',
-    'downsample': 'pool-nearest',
-    'resample': 'pool-nearest',
-    'spatial2channel': 'spatial2channel-channel2spatial',
-}
-
-
-def _normalize_sample_type(sample_type: str) -> str:
-    new = _DEPRECATED_SAMPLE_TYPES.get(sample_type)
-    if new is not None:
-        warnings.warn(
-            f"sample_type={sample_type!r} is deprecated; use {new!r} instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return new
-    return sample_type
-
-
 class Sparse3DUNet(nn.Module):
     """
     Generic sparse 3D UNet with separated resampling and residual refinement.
@@ -47,13 +25,6 @@ class Sparse3DUNet(nn.Module):
     Operates purely on sparse features -- it has no knowledge of point maps,
     log-depth, voxelization, or UV. The caller is responsible for building the
     sparse representation (feats/coords/shape) and interpreting the output.
-
-    Submodule names match the v3_5 refiner (`SparsePointCloudUnetRefiner3d`,
-    sparse_unet_5.py) so that v3_5-trained weights load unchanged.
-
-    Down/up transitions only change sparse resolution. Encoder residual stages
-    run before downsampling. Bottleneck blocks run after encoder-feature
-    fusion. Decoder residual stages run after each upsample + skip fusion.
 
     forward(feats, coords, shape, encoder_feature):
     - feats: (M, in_channels) raw input features.
@@ -76,7 +47,6 @@ class Sparse3DUNet(nn.Module):
         encoder_downsample: int = 16,
         encoder_proj: Literal['linear', 'res'] = 'res',
         use_checkpoint: bool = False,
-        sample_type: Literal['spatial2channel-channel2spatial', 'pool-nearest'] = 'pool-nearest',
         norm: bool = True,
         activation: Literal['silu', 'relu'] = 'silu',
         **deprecated_kwargs,
@@ -101,10 +71,9 @@ class Sparse3DUNet(nn.Module):
 
         self.encoder_downsample = encoder_downsample
         self.downsample_factors = downsample_factors
-        assert self.encoder_downsample == math.prod(self.downsample_factors)
+        assert self.encoder_downsample == math.prod(self.downsample_factors), \
+            f"encoder_downsample ({self.encoder_downsample}) must equal the product of downsample_factors ({math.prod(self.downsample_factors)})"
         self.encoder_proj = encoder_proj
-        self.sample_type = _normalize_sample_type(sample_type)
-        sample_type = self.sample_type
         self.norm = norm
         self.activation = activation
 
@@ -133,7 +102,6 @@ class Sparse3DUNet(nn.Module):
             if i < len(model_channels) - 1:
                 self.downsample_blocks.append(
                     self.get_downsample_block(
-                        downsample_type=sample_type,
                         in_channel=model_channels[i],
                         out_channel=model_channels[i + 1],
                         downsample_factor=self.downsample_factors[i],
@@ -151,7 +119,6 @@ class Sparse3DUNet(nn.Module):
             target_level = source_level - 1
             self.upsample_blocks.append(
                 self.get_upsample_block(
-                    upsample_type=sample_type,
                     channels=model_channels[source_level],
                     out_channels=model_channels[target_level],
                     upsample_factor=self.downsample_factors[target_level],
@@ -202,35 +169,19 @@ class Sparse3DUNet(nn.Module):
 
     def get_downsample_block(
         self,
-        downsample_type: str,
         in_channel: int,
         out_channel: int,
         downsample_factor: int,
     ) -> nn.Module:
-        if downsample_type == 'pool-nearest':
-            return PoolDown(in_channel, out_channel, downsample_factor)
-        if downsample_type == 'spatial2channel-channel2spatial':
-            return PixelUnshuffleDown(
-                in_channel, out_channel,
-                (downsample_factor, downsample_factor, downsample_factor),
-            )
-        raise ValueError(f"Invalid downsample_type: {downsample_type}")
+        return PoolDown(in_channel, out_channel, downsample_factor)
 
     def get_upsample_block(
         self,
-        upsample_type: str,
         channels: int,
         out_channels: int,
         upsample_factor: int,
     ) -> nn.Module:
-        if upsample_type == 'pool-nearest':
-            return NearestUp(channels, out_channels, upsample_factor)
-        if upsample_type == 'spatial2channel-channel2spatial':
-            return PixelShuffleUp(
-                channels, out_channels,
-                (upsample_factor, upsample_factor, upsample_factor),
-            )
-        raise ValueError(f"Invalid upsample_type: {upsample_type}")
+        return NearestUp(channels, out_channels, upsample_factor)
 
     def _sample_encoder_feature(
         self,
