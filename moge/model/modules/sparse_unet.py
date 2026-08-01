@@ -13,7 +13,6 @@ from .flex_sparse_blocks import (
     PixelShuffleUp,
     PoolDown,
     NearestUp,
-    get_activation,
 )
 from flex_gemm.ops import NeighborCache
 
@@ -47,8 +46,6 @@ class Sparse3DUNet(nn.Module):
         encoder_downsample: int = 16,
         encoder_proj: Literal['linear', 'res'] = 'res',
         use_checkpoint: bool = False,
-        norm: bool = True,
-        activation: Literal['silu', 'relu'] = 'silu',
         **deprecated_kwargs,
     ):
         super().__init__()
@@ -74,8 +71,6 @@ class Sparse3DUNet(nn.Module):
         assert self.encoder_downsample == math.prod(self.downsample_factors), \
             f"encoder_downsample ({self.encoder_downsample}) must equal the product of downsample_factors ({math.prod(self.downsample_factors)})"
         self.encoder_proj = encoder_proj
-        self.norm = norm
-        self.activation = activation
 
         encoder_block_counts = self._resolve_blocks_per_level(
             encoder_blocks_per_level, len(model_channels), 'encoder_blocks_per_level'
@@ -89,7 +84,7 @@ class Sparse3DUNet(nn.Module):
         bottleneck_channels = model_channels[-1]
         self.fuse_proj = nn.Sequential(
             nn.Linear(bottleneck_channels * 2, bottleneck_channels),
-            get_activation(self.activation),
+            nn.SiLU(),
             nn.Linear(bottleneck_channels, bottleneck_channels),
         )
 
@@ -150,12 +145,12 @@ class Sparse3DUNet(nn.Module):
     def _make_stage(self, channels: int, num_blocks: int, encoder_proj: Literal['linear', 'res']) -> nn.ModuleList:
         if encoder_proj == 'res':
             return nn.ModuleList([
-                SparseResBlock3d(channels, norm=self.norm, activation=self.activation)
+                SparseResBlock3d(channels)
                 for _ in range(num_blocks)
             ])
         if encoder_proj == 'linear':
             return nn.ModuleList([
-                PointwiseBlock(channels, channels, get_activation(self.activation))
+                PointwiseBlock(channels, channels)
                 for _ in range(num_blocks)
             ])
         raise ValueError(f"Invalid encoder_proj: {encoder_proj}")

@@ -23,8 +23,7 @@ def _pick_spconv_algorithm(in_channels: int, out_channels: int) -> str:
     """Pick the submanifold-conv index-GEMM variant by channel width.
 
     Wide GEMMs (max(in, out) >= 128) benefit from `masked_implicit_gemm`;
-    narrow ones stay on the default `implicit_gemm`. Threshold determined
-    empirically on v3_4 with model_channels=[32, 64, 128, 256, 1024].
+    narrow ones stay on the default `implicit_gemm`.
     """
     if max(in_channels, out_channels) >= 128:
         return "masked_implicit_gemm"
@@ -36,15 +35,6 @@ def make_conv3d(in_channels: int, out_channels: int, kernel_size: int = 3) -> Su
         in_channels, out_channels, kernel_size,
         algorithm=_pick_spconv_algorithm(in_channels, out_channels),
     )
-
-
-def get_activation(activation: Literal["relu", "silu"]) -> nn.Module:
-    if activation == "relu":
-        return nn.ReLU()
-    elif activation == "silu":
-        return nn.SiLU()
-    else:
-        raise ValueError(f"Unsupported activation: {activation}")
 
 
 def _with_channels(shape: torch.Size, channels: int) -> torch.Size:
@@ -64,10 +54,10 @@ def _ceil_downsample_shape(shape: torch.Size, sparse_dim: int, factor: int) -> t
 
 
 class PointwiseBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, activation: nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.linear = nn.Linear(in_ch, out_ch)
-        self.act = activation
+        self.act = nn.SiLU()
         self.use_checkpoint = False
 
     def _forward(self, feats, coords, shape, neighbor_cache=None):
@@ -83,15 +73,14 @@ class PointwiseBlock(nn.Module):
 
 
 class SparseResBlock3d(nn.Module):
-    def __init__(self, channels: int, out_channels: int = None,
-                 norm: bool = True, activation: Literal["silu", "relu"] = "silu"):
+    def __init__(self, channels: int, out_channels: int = None):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
         self.use_checkpoint = False
 
-        self.norm1 = nn.LayerNorm(channels, elementwise_affine=True, eps=1e-6) if norm else nn.Identity()
-        self.activation_fn = F.silu if activation == "silu" else F.relu
+        self.norm1 = nn.LayerNorm(channels, elementwise_affine=True, eps=1e-6)
+        self.activation_fn = F.silu
 
         self.conv1 = make_conv3d(channels, self.out_channels)
         self.conv2 = zero_module(make_conv3d(self.out_channels, self.out_channels))
