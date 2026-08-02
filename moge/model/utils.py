@@ -30,18 +30,41 @@ def sync_ddp_hook(state, bucket: torch.distributed.GradBucket) -> torch.futures.
     return fut
 
 
-def wrap_module_with_autocast(module: nn.Module, **autocast_kwargs):
-    class _AutocastWrapper(module.__class__):
-        _restore_cls = module.__class__
-        is_autocast_wrapper = True
-        def forward(self, *args, **kwargs):
-            with torch.autocast(**autocast_kwargs):
-                return super().forward(*args, **kwargs)
+class AutocastHandle:
+    """Handle returned by `wrap_module_with_autocast`. Call `remove` to undo the wrapping."""
 
-    module.__class__ = _AutocastWrapper
-    return module
+    def __init__(self, pre_handle, post_handle):
+        self._pre_handle = pre_handle
+        self._post_handle = post_handle
+        self._removed = False
+
+    def remove(self) -> None:
+        if self._removed:
+            return
+        self._pre_handle.remove()
+        self._post_handle.remove()
+        self._removed = True
 
 
-def unwrap_module(module: nn.Module):
-    if hasattr(module.__class__, '_restore_cls'):
-        module.__class__ = module.__class__._restore_cls
+def wrap_module_with_autocast(module: nn.Module, **autocast_kwargs) -> AutocastHandle:
+    """Run `module`'s forward inside a `torch.autocast(**autocast_kwargs)` context, via forward hooks.
+
+    The context is entered in a pre-hook and exited in a post-hook registered with
+    `always_call=True`, so it is closed even if forward raises. The post-hook uses
+    `prepend=True` so that stacked wrappers unwind in LIFO order.
+    """
+    cm_stack: List[torch.autocast] = []
+
+    def _pre_hook(_module, _args, _kwargs):
+        cm = torch.autocast(**autocast_kwargs)
+        cm.__enter__()
+        cm_stack.append(cm)
+
+    def _post_hook(_module, _args, _kwargs, output):
+        if cm_stack:
+            cm_stack.pop().__exit__(None, None, None)
+        return output
+
+    pre_handle = module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+    post_handle = module.register_forward_hook(_post_hook, with_kwargs=True, always_call=True, prepend=True)
+    return AutocastHandle(pre_handle, post_handle)

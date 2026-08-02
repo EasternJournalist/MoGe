@@ -11,7 +11,7 @@ from .flex_sparse_blocks import (
     PoolDown,
     NearestUp,
 )
-from ..utils import wrap_module_with_gradient_checkpointing, wrap_module_with_autocast, unwrap_module
+from ..utils import wrap_module_with_gradient_checkpointing, wrap_module_with_autocast
 from flex_gemm.ops import NeighborCache
 
 
@@ -148,9 +148,9 @@ class Sparse3DUNet(nn.Module):
                 wrap_module_with_gradient_checkpointing(block)
 
     def enable_mixed_precision(self, dtype: torch.dtype = torch.bfloat16):
-        if getattr(self.__class__, 'is_autocast_wrapper', False):
-            unwrap_module(self)
-        wrap_module_with_autocast(self, device_type='cuda', dtype=dtype)
+        if getattr(self, '_autocast_handle', None) is not None:
+            self._autocast_handle.remove()
+        self._autocast_handle = wrap_module_with_autocast(self, device_type='cuda', dtype=dtype)
 
     def _sample_encoder_feature(
         self,
