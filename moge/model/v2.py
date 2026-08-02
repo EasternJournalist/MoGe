@@ -20,7 +20,7 @@ from .modules.dinov2_encoder import DINOv2Encoder
 from .modules.mlp import MLP
 from .modules.conv_stack import ConvStack
 
-    
+
 class MoGeModel(nn.Module):
     encoder: DINOv2Encoder
     neck: ConvStack
@@ -104,8 +104,23 @@ class MoGeModel(nn.Module):
         if model_kwargs is not None:
             model_config.update(model_kwargs)
         model = cls(**model_config)
-        model.load_state_dict(checkpoint['model'], strict=False)
-        
+
+        # NOTE: `strict=False` so that a checkpoint may legitimately omit optional heads. That also
+        # means anything the checkpoint does not provide silently keeps its random initialization,
+        # so report it -- e.g. loading a v2 checkpoint into a v3 config leaves the whole refiner
+        # untrained, which is otherwise indistinguishable from a bad prediction.
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
+        if missing_keys:
+            warnings.warn(
+                f"{len(missing_keys)} parameter(s) are absent from the checkpoint and keep their random "
+                f"initialization: {missing_keys}"
+            )
+        if unexpected_keys:
+            warnings.warn(
+                f"{len(unexpected_keys)} parameter(s) in the checkpoint have no counterpart in the model "
+                f"and were ignored: {unexpected_keys}"
+            )
+
         return model
     
     def init_weights(self):
