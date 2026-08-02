@@ -39,15 +39,6 @@ def convert_module_to(l: nn.Module, dtype):
             p.data = p.data.to(dtype)
 
 
-def zero_module(module: nn.Module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
-
-
 def scale_module(module: nn.Module, scale):
     """
     Scale the parameters of a module and return it.

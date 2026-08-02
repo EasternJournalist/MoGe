@@ -6,8 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from .utils import zero_module
-
 from flex_gemm.nn import (
     SubmanifoldConv3d,
     SparsePool3d,
@@ -79,11 +77,15 @@ class SparseResBlock3d(nn.Module):
         self.activation_fn = F.silu
 
         self.conv1 = make_conv3d(channels, self.out_channels)
-        self.conv2 = zero_module(make_conv3d(self.out_channels, self.out_channels))
+        self.conv2 = make_conv3d(self.out_channels, self.out_channels)
         self.skip_connection = (
             nn.Linear(channels, self.out_channels)
             if channels != self.out_channels else nn.Identity()
         )
+
+    def init_weights(self):
+        for parameter in self.conv2.parameters():
+            nn.init.zeros_(parameter)
 
     def _forward(self, feats, coords, shape, neighbor_cache=None):
         h = self.activation_fn(self.norm1(feats).type_as(feats))

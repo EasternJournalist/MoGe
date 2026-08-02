@@ -5,7 +5,6 @@ import warnings
 import torch
 import torch.nn as nn
 
-from .utils import zero_module
 from .flex_sparse_blocks import (
     PointwiseBlock,
     SparseResBlock3d,
@@ -113,10 +112,18 @@ class Sparse3DUNet(nn.Module):
                 self._make_stage(model_channels[target_level], decoder_block_counts[i])
             )
 
-        self.out_proj = zero_module(nn.Linear(model_channels[0], out_channels))
+        self.out_proj = nn.Linear(model_channels[0], out_channels)
 
         if use_checkpoint:
             self.enable_gradient_checkpointing()
+
+    def init_weights(self):
+        for module in self.modules():
+            if isinstance(module, SparseResBlock3d):
+                module.init_weights()
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
     @staticmethod
     def _resolve_blocks_per_level(

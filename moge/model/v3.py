@@ -44,6 +44,11 @@ class MoGeModel(MoGeModelV2):
         else:
             print("Warning: refiner is not enabled.")
 
+    def init_weights(self):
+        super().init_weights()
+        if hasattr(self, 'refiner'):
+            self.refiner.init_weights()
+
     def enable_refiner_gradient_checkpointing(self):
         self.refiner.enable_gradient_checkpointing()
 
