@@ -325,12 +325,13 @@ class MoGeModel(MoGeModelV2):
                 per_step_masks = None
                 points, depth, intrinsics = None, None, None
 
-            if apply_mask and per_step_masks is not None:
-                points_all = [torch.where(m[..., None], p, torch.inf) for p, m in zip(points_all, per_step_masks)]
-                depth_all = [torch.where(m, d, torch.inf) for d, m in zip(depth_all, per_step_masks)]
-                points = points_all[-1]
-                depth = depth_all[-1]
-                normal = torch.where(mask_binary[..., None], normal, torch.zeros_like(normal)) if normal is not None else None
+            if apply_mask:
+                if per_step_masks is not None:
+                    points_all = [torch.where(m[..., None], p, torch.inf) for p, m in zip(points_all, per_step_masks)]
+                    depth_all  = [torch.where(m, d, torch.inf) for d, m in zip(depth_all, per_step_masks)]
+                    points, depth = points_all[-1], depth_all[-1]
+                if mask_binary is not None and normal is not None:
+                    normal = torch.where(mask_binary[..., None], normal, torch.zeros_like(normal))
 
         return_dict = {
             'points': points,
