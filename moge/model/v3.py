@@ -19,7 +19,7 @@ class MoGeModel(MoGeModelV2):
         mask_head: Dict[str, Any] = None,
         normal_head: Dict[str, Any] = None,
         scale_head: Dict[str, Any] = None,
-        remap_output: Literal['linear', 'sinh', 'exp', 'sinh_exp'] = 'linear',
+        remap_output: Literal['linear', 'sinh', 'exp', 'sinh_exp'] = 'exp',
         num_tokens_range: List[int] = [1200, 3600],
         refiner: Optional[Dict[str, Any]] = None,
         **deprecated_kwargs,
