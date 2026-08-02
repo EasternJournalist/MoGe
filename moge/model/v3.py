@@ -119,7 +119,6 @@ class MoGeModel(MoGeModelV2):
         num_tokens: Union[int, torch.LongTensor],
         refine_steps: int = 3,
         refiner_detach_backbone: bool = True,
-        detach_refine_coords: bool = False,
         return_delta_z: bool = False,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, img_h, img_w = image.shape
