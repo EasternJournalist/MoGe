@@ -127,15 +127,6 @@ def write_jsonl(data: List[dict], file):
             f.write(json.dumps(item) + '\n')
 
 
-def to_hierachical_dataframe(data: List[Dict[Tuple[str, ...], Any]]):
-    import pandas as pd
-    data = [flatten_nested_dict(d) for d in data]
-    df = pd.DataFrame(data)
-    df = df.sort_index(axis=1)
-    df.columns = pd.MultiIndex.from_tuples(df.columns)  
-    return df
-
-
 def recursive_replace(d: Union[List, Dict, str], mapping: Dict[str, str]):
     if isinstance(d, str):
         for old, new in mapping.items():
