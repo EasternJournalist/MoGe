@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import utils3d
 
-from ..utils.geometry_torch import normalized_view_plane_uv
+from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift
 from .v2 import MoGeModel as MoGeModelV2
 from .modules import Sparse3DUNet
 
@@ -69,10 +69,14 @@ class MoGeModel(MoGeModelV2):
         - uv:   [H, W, 2] UV at the point-map resolution,
 
         Returns (feats, coords, shape, logz):
-        - feats:  (M, in_channels) input features ([uv, logz] or [logz]).
+        - feats:  (M, 3) fp32 input features [uv, logz].
         - coords: (M, 4) int32, columns (batch, i, j, z_bin).
         - shape:  Size([B, H, W, z_extent, in_channels]).
-        - logz:   [B, H, W] dense log-depth (for the residual update).
+        - logz:   [B, H, W] dense fp32 log-depth (for the residual update).
+
+        Everything here is forced to fp32: the z binning is quantized at
+        1/refiner_depth_resolution, which is finer than fp16 resolution over the
+        usual logz range, so binning in fp16 would collapse/jitter voxels.
         """
         if point_coord.ndim != 4 or point_coord.shape[-1] != 3:
             raise ValueError(f"point_coord must be [B, H, W, 3], got {point_coord.shape}")
@@ -80,7 +84,7 @@ class MoGeModel(MoGeModelV2):
         bsz, height, width, _ = point_coord.shape
         device = point_coord.device
 
-        logz = point_coord[..., 2]
+        logz = point_coord[..., 2].float()
         zq = torch.round(logz * self.refiner_depth_resolution).long()
         z_offset = zq.amin(dim=(1, 2), keepdim=True)
         z_idx = zq - z_offset
@@ -91,7 +95,7 @@ class MoGeModel(MoGeModelV2):
         batch = torch.arange(bsz, device=device, dtype=torch.long).view(bsz, 1, 1).expand(bsz, height, width)
 
         coords = torch.stack([batch, i, j, z_idx], dim=-1).reshape(-1, 4).to(torch.int32)
-        feats = torch.cat([uv.unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
+        feats = torch.cat([uv.float().unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
         shape = torch.Size([bsz, height, width, z_extent, feats.shape[-1]])
         return feats, coords, shape, logz
 
@@ -105,7 +109,7 @@ class MoGeModel(MoGeModelV2):
         bsz, height, width, _ = point_coord.shape
         feats, coords, shape, logz = self._voxelize(point_coord, uv)
         out = self.refiner(feats, coords, shape, encoder_feature)
-        out_logz = out.squeeze(-1).reshape(bsz, height, width)
+        out_logz = out.float().squeeze(-1).reshape(bsz, height, width)
         refined_logz = logz + out_logz
         if return_delta_z:
             delta_z = (torch.exp(refined_logz) - torch.exp(logz)).detach()
@@ -121,6 +125,9 @@ class MoGeModel(MoGeModelV2):
         refiner_detach_backbone: bool = True,
         return_delta_z: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        if refine_steps > 0 and not hasattr(self, 'refiner'):
+            raise ValueError("Refiner is not enabled but refine_steps > 0.")
+
         batch_size, _, img_h, img_w = image.shape
         device, dtype = image.device, image.dtype
 
@@ -132,7 +139,6 @@ class MoGeModel(MoGeModelV2):
             base_h, base_w = round(base_h), round(base_w)
 
         # Backbones encoding
-        feat_h, feat_w = base_h * self.encoder_patch_size, base_w * self.encoder_patch_size
         features, cls_token = self.encoder(image, base_h, base_w, return_class_token=True)
         features = [features, None, None, None, None]
 
@@ -183,7 +189,7 @@ class MoGeModel(MoGeModelV2):
             if refine_steps > 0:
                 refiner_feature: torch.Tensor = features[0]
 
-                current_points = raw_points.permute(0, 2, 3, 1) # BHW3 at (x/z, y/z, logz)
+                current_points = raw_points.permute(0, 2, 3, 1).float() # BHW3 at (x/z, y/z, logz)
                 for _ in range(refine_steps):
                     coord_for_refiner = current_points.detach()
                     feature_for_refiner = refiner_feature.detach() if refiner_detach_backbone else refiner_feature
@@ -222,11 +228,14 @@ class MoGeModel(MoGeModelV2):
         num_tokens: int = None,
         resolution_level: int = 9,
         force_projection: bool = True,
-        apply_mask: Literal[False, True, 'blend'] = True,
+        apply_mask: bool = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
         refine_steps: int = 3,
         use_fp16: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        if refine_steps > 0 and not hasattr(self, 'refiner'):
+            raise ValueError("Refiner is not enabled but refine_steps > 0.")
+
         if image.dim() == 3:
             omit_batch_dim = True
             image = image.unsqueeze(0)
@@ -257,8 +266,6 @@ class MoGeModel(MoGeModelV2):
                 mask_binary = None
 
             if points_all is not None:
-                from ..utils.geometry_torch import recover_focal_shift
-
                 # Per-step (focal, shift) recovery: refinement modifies logz which changes
                 # the 3D shape, so focal recovered from each step's point map differs.
                 # Jointly solving (focal, shift) on the same point map gives the optimal
