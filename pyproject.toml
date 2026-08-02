@@ -1,36 +1,86 @@
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "moge"
-version = "2.0.0"
-description = "MoGe: Unlocking Accurate Monocular Geometry Estimation for Open-Domain Images with Optimal Training Supervision"
+version = "3.0.0"
+description = "MoGe-3: Fine-Detail Monocular Geometry Estimation with Self-Guided Sparse Volumetric Refinement"
 readme = "README.md"
 license = {text = "MIT"}
+requires-python = "==3.13.*"
 dependencies = [
-    "click",
-    "opencv-python",
-    "scipy",
-    "matplotlib",
-    "trimesh",
-    "pillow",
-    "huggingface_hub",
-    "numpy",
-    "torch>=2.0.0",
-    "torchvision",
+    "click>=8.3.1",
+    "opencv-python-headless==4.10.0.84",
+    "scikit-learn>=1.8.0",
+    "pillow>=12.1.1",
+    "matplotlib>=3.10.8",
+    "trimesh>=4.11.2",
+    "sympy>=1.14.0",
+    "numpy==2.2.6",
+    "python-dateutil>=2.9.0.post0",
+    "pytz>=2025.2",
+    "wrapt>=2.1.1",
+    "pipeline",
     "gradio",
-    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183",
-    "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6"
+    "utils3d",
 ]
-requires-python = ">=3.9"
 
-[project.urls]
-Homepage = "https://github.com/microsoft/MoGe"
+[project.optional-dependencies]
+cu130 = [
+  "torch==2.10.0+cu130",
+  "torchvision==0.25.0+cu130",
+  "accelerate>=1.12.0",
+  "open-clip-torch>=3.2.0",
+  "flex-gemm",
+]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["moge*"]
+cu128 = [
+  "torch==2.10.0+cu128",
+  "torchvision==0.25.0+cu128",
+  "accelerate>=1.12.0",
+  "open-clip-torch>=3.2.0",
+  "flex-gemm",
+]
 
-[project.scripts]
-moge = "moge.scripts.cli:main"
+train = [
+  "wandb>=0.25.0",
+  "gitpython>=3.1.43",
+  "tensorboard>=2.20.0",
+]
+
+dev = [
+  "ipykernel"
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+conflicts = [
+  [
+    { extra = "cu130" },
+    { extra = "cu128" },
+  ],
+]
+prerelease = "if-necessary-or-explicit"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", extra = "cu130" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
+  { index = "pytorch-cu130", extra = "cu130" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+pipeline = { git = "https://github.com/EasternJournalist/pipeline.git" }
+utils3d = { git = "https://github.com/EasternJournalist/utils3d.git", rev = "94d1037aabbce32dea9c07a7c4849525817a1615" }
+flex-gemm = { git = "https://github.com/JeffreyXiang/FlexGEMM.git", rev = "b2fadb29d41846c7981ade6801ffc689fae119cf" }
+
+[tool.uv.extra-build-dependencies]
+flex-gemm = [{ requirement = "torch", match-runtime = true }]
