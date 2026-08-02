@@ -11,6 +11,7 @@ from .flex_sparse_blocks import (
     PoolDown,
     NearestUp,
 )
+from ..utils import wrap_module_with_gradient_checkpointing, wrap_module_with_autocast, unwrap_module
 from flex_gemm.ops import NeighborCache
 
 
@@ -41,7 +42,6 @@ class Sparse3DUNet(nn.Module):
         bottleneck_blocks: int = 1,
         downsample_factors: Optional[List[int]] = None,
         encoder_downsample: int = 16,
-        use_checkpoint: bool = False,
         **deprecated_kwargs,
     ):
         super().__init__()
@@ -114,9 +114,6 @@ class Sparse3DUNet(nn.Module):
 
         self.out_proj = nn.Linear(model_channels[0], out_channels)
 
-        if use_checkpoint:
-            self.enable_gradient_checkpointing()
-
     def init_weights(self):
         for module in self.modules():
             if isinstance(module, SparseResBlock3d):
@@ -146,11 +143,14 @@ class Sparse3DUNet(nn.Module):
         ])
 
     def enable_gradient_checkpointing(self):
-        for module in self.modules():
-            if module is self:
-                continue
-            if hasattr(module, 'use_checkpoint'):
-                module.use_checkpoint = True
+        for stage in [*self.down_stages, self.bottleneck_stage, *self.up_stages]:
+            for block in stage:
+                wrap_module_with_gradient_checkpointing(block)
+
+    def enable_mixed_precision(self, dtype: torch.dtype = torch.bfloat16):
+        if getattr(self.__class__, 'is_autocast_wrapper', False):
+            unwrap_module(self)
+        wrap_module_with_autocast(self, device_type='cuda', dtype=dtype)
 
     def _sample_encoder_feature(
         self,

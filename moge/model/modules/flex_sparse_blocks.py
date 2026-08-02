@@ -4,7 +4,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 
 from flex_gemm.nn import (
     SubmanifoldConv3d,
@@ -52,18 +51,9 @@ class PointwiseBlock(nn.Module):
         super().__init__()
         self.linear = nn.Linear(in_ch, out_ch)
         self.act = nn.SiLU()
-        self.use_checkpoint = False
-
-    def _forward(self, feats, coords, shape, neighbor_cache=None):
-        return self.act(self.linear(feats)), neighbor_cache
 
     def forward(self, feats, coords, shape, neighbor_cache=None):
-        if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(
-                self._forward, feats, coords, shape, neighbor_cache,
-                use_reentrant=False,
-            )
-        return self._forward(feats, coords, shape, neighbor_cache)
+        return self.act(self.linear(feats)), neighbor_cache
 
 
 class SparseResBlock3d(nn.Module):
@@ -71,7 +61,6 @@ class SparseResBlock3d(nn.Module):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
-        self.use_checkpoint = False
 
         self.norm1 = nn.LayerNorm(channels, elementwise_affine=True, eps=1e-6)
         self.activation_fn = F.silu
@@ -87,20 +76,12 @@ class SparseResBlock3d(nn.Module):
         for parameter in self.conv2.parameters():
             nn.init.zeros_(parameter)
 
-    def _forward(self, feats, coords, shape, neighbor_cache=None):
+    def forward(self, feats, coords, shape, neighbor_cache=None):
         h = self.activation_fn(self.norm1(feats).type_as(feats))
         h, neighbor_cache = self.conv1(h, coords, shape, neighbor_cache=neighbor_cache)
         h = self.activation_fn(h)
         h, neighbor_cache = self.conv2(h, coords, shape, neighbor_cache=neighbor_cache)
         return h + self.skip_connection(feats), neighbor_cache
-
-    def forward(self, feats, coords, shape, neighbor_cache=None):
-        if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(
-                self._forward, feats, coords, shape, neighbor_cache,
-                use_reentrant=False,
-            )
-        return self._forward(feats, coords, shape, neighbor_cache)
 
 
 class PoolDown(nn.Module):

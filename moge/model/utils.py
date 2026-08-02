@@ -47,3 +47,20 @@ def sync_ddp_hook(state, bucket: torch.distributed.GradBucket) -> torch.futures.
     fut = torch.futures.Future()
     fut.set_result(grad)
     return fut
+
+
+def wrap_module_with_autocast(module: nn.Module, **autocast_kwargs):
+    class _AutocastWrapper(module.__class__):
+        _restore_cls = module.__class__
+        is_autocast_wrapper = True
+        def forward(self, *args, **kwargs):
+            with torch.autocast(**autocast_kwargs):
+                return super().forward(*args, **kwargs)
+
+    module.__class__ = _AutocastWrapper
+    return module
+
+
+def unwrap_module(module: nn.Module):
+    if hasattr(module.__class__, '_restore_cls'):
+        module.__class__ = module.__class__._restore_cls

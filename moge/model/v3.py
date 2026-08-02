@@ -49,14 +49,10 @@ class MoGeModel(MoGeModelV2):
         if hasattr(self, 'refiner'):
             self.refiner.init_weights()
 
-    def enable_refiner_gradient_checkpointing(self):
-        self.refiner.enable_gradient_checkpointing()
-
-    def enable_refiner_mixed_precision(self, dtype: torch.dtype = torch.bfloat16):
-        from .utils import wrap_module_with_autocast, unwrap_module
-        if getattr(self.refiner.__class__, 'is_autocast_wrapper', False):
-            unwrap_module(self.refiner)
-        wrap_module_with_autocast(self.refiner, device_type='cuda', dtype=dtype)
+    def enable_gradient_checkpointing(self):
+        super().enable_gradient_checkpointing()
+        if hasattr(self, 'refiner'):
+            self.refiner.enable_gradient_checkpointing()
 
     def _replace_logz(self, old_coord: torch.Tensor, new_logz: torch.Tensor) -> torch.Tensor:
         uv = old_coord[..., :2]
