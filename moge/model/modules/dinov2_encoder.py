@@ -47,8 +47,8 @@ class DINOv2Encoder(nn.Module):
         self._onnx_compatible_mode = value
         self.backbone.onnx_compatible_mode = value
 
-    def init_weights(self, pretrained_path: Optional[Union[str, os.PathLike]] = None):
-        pretrained_backbone_state_dict = self.hub_loader(pretrained=True, pretrained_path=pretrained_path).state_dict()
+    def init_weights(self):
+        pretrained_backbone_state_dict = self.hub_loader(pretrained=True).state_dict()
         self.backbone.load_state_dict(pretrained_backbone_state_dict)
 
     def enable_gradient_checkpointing(self):
