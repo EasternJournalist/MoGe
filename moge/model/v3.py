@@ -132,10 +132,12 @@ class MoGeModel(MoGeModelV2):
         else:
             base_h, base_w = round(base_h), round(base_w)
 
+        # Backbones encoding
         feat_h, feat_w = base_h * self.encoder_patch_size, base_w * self.encoder_patch_size
         features, cls_token = self.encoder(image, base_h, base_w, return_class_token=True)
         features = [features, None, None, None, None]
 
+        # Concat UVs for aspect ratio input
         uv_for_refiner: Optional[torch.Tensor] = None
         for level in range(5):
             uv = normalized_view_plane_uv(width=base_w * 2 ** level, height=base_h * 2 ** level, aspect_ratio=aspect_ratio, dtype=dtype, device=device)
@@ -147,8 +149,11 @@ class MoGeModel(MoGeModelV2):
                 features[level] = uv
             else:
                 features[level] = torch.concat([features[level], uv], dim=1)
+
+        # Shared neck
         neck_features = self.neck(features)
 
+        # Heads decoding
         raw_points = self.points_head(neck_features)[-1] if hasattr(self, 'points_head') else None
         normal, mask = (
             getattr(self, head)(neck_features)[-1] if hasattr(self, head) else None
@@ -156,6 +161,7 @@ class MoGeModel(MoGeModelV2):
         )
         metric_scale = self.scale_head(cls_token) if hasattr(self, 'scale_head') else None
 
+        # Resize
         resize_fn = lambda x: F.interpolate(x, (img_h, img_w), mode='bilinear', align_corners=False, antialias=False)
         normal, mask = (resize_fn(x) if x is not None else None for x in [normal, mask])
 
@@ -169,6 +175,7 @@ class MoGeModel(MoGeModelV2):
             points = self._remap_points(points) # BHW3 at (x, y, z)
             return points
 
+        # Process points and optionally refine them
         points_all: List[torch.Tensor] = []
         delta_z_all: List[torch.Tensor] = []
         if raw_points is not None: # raw_points is B3HW at (x/z, y/z, logz)
@@ -189,6 +196,7 @@ class MoGeModel(MoGeModelV2):
                     if return_delta_z:
                         delta_z_all.append(delta_z)
 
+        # Remap
         if normal is not None:
             normal = normal.permute(0, 2, 3, 1)
             normal = F.normalize(normal, dim=-1)
@@ -230,14 +238,17 @@ class MoGeModel(MoGeModelV2):
         original_height, original_width = image.shape[-2:]
         aspect_ratio = original_width / original_height
 
+        # Determine the number of base tokens to use
         if num_tokens is None:
             min_tokens, max_tokens = self.num_tokens_range
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
 
+        # Forward pass
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_fp16 and self.dtype != torch.float16):
             output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps)
         points_all, normal, mask, metric_scale = (output.get(k, None) for k in ['points_all', 'normal', 'mask', 'metric_scale'])
 
+        # Always process the output in fp32 precision
         points_all = [p.float() for p in points_all] if points_all is not None else None
         normal, mask, metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [normal, mask, metric_scale, fov_x])
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):
