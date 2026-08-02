@@ -1,5 +1,6 @@
 from typing import *
 from numbers import Number
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -35,14 +36,13 @@ class MoGeModel(MoGeModelV2):
             num_tokens_range=num_tokens_range,
             **deprecated_kwargs,
         )
-        self.encoder_patch_size: int = self.encoder.backbone.patch_size
 
         if refiner is not None:
             refiner_cfg = dict(refiner)
             self.refiner_depth_resolution: float = refiner_cfg.pop('depth_resolution', 256)
             self.refiner = Sparse3DUNet(**refiner_cfg)
         else:
-            print("Warning: refiner is not enabled.")
+            warnings.warn("Warning: refiner is not enabled.")
 
     def init_weights(self):
         super().init_weights()

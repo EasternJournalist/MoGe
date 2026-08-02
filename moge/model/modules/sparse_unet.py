@@ -46,7 +46,7 @@ class Sparse3DUNet(nn.Module):
     ):
         super().__init__()
         if deprecated_kwargs:
-            print(f"Warning: Sparse3DUNet got unexpected kwargs: {deprecated_kwargs}")
+            warnings.warn(f"Warning: Sparse3DUNet got unexpected kwargs: {deprecated_kwargs}")
         if len(model_channels) < 2:
             raise ValueError(f"model_channels must have at least 2 levels, got {model_channels}")
         if downsample_factors is None:
