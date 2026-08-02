@@ -60,15 +60,13 @@ class MoGeModel(MoGeModelV2):
     def _voxelize(
         self,
         point_coord: torch.Tensor,
-        shared_uv: torch.Tensor,
+        uv: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Size, torch.Tensor]:
         """
         Convert dense point coordinates to a sparse representation.
 
         - point_coord: [B, H, W, 3] at (x/z, y/z, logz).
-        - shared_uv:   [H, W, 2] view-plane UV at the point-map resolution,
-                       reused from the forward pass (head/neck UV) instead of
-                       being recomputed here.
+        - uv:   [H, W, 2] UV at the point-map resolution,
 
         Returns (feats, coords, shape, logz):
         - feats:  (M, in_channels) input features ([uv, logz] or [logz]).
@@ -93,8 +91,7 @@ class MoGeModel(MoGeModelV2):
         batch = torch.arange(bsz, device=device, dtype=torch.long).view(bsz, 1, 1).expand(bsz, height, width)
 
         coords = torch.stack([batch, i, j, z_idx], dim=-1).reshape(-1, 4).to(torch.int32)
-        uv = shared_uv.unsqueeze(0).expand(bsz, -1, -1, -1)
-        feats = torch.cat([uv, logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
+        feats = torch.cat([uv.unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
         shape = torch.Size([bsz, height, width, z_extent, feats.shape[-1]])
         return feats, coords, shape, logz
 
@@ -102,11 +99,11 @@ class MoGeModel(MoGeModelV2):
         self,
         point_coord: torch.Tensor,
         encoder_feature: torch.Tensor,
-        shared_uv: torch.Tensor,
+        uv: torch.Tensor,
         return_delta_z: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, height, width, _ = point_coord.shape
-        feats, coords, shape, logz = self._voxelize(point_coord, shared_uv)
+        feats, coords, shape, logz = self._voxelize(point_coord, uv)
         out = self.refiner(feats, coords, shape, encoder_feature)
         out_logz = out.squeeze(-1).reshape(bsz, height, width)
         refined_logz = logz + out_logz
@@ -140,14 +137,11 @@ class MoGeModel(MoGeModelV2):
         features, cls_token = self.encoder(image, base_h, base_w, return_class_token=True)
         features = [features, None, None, None, None]
 
-        # The point map fed to the refiner lives at the head's finest resolution
-        # (level 4 = base * 16). Capture that level's view-plane UV (built with
-        # the exact aspect ratio) so the refiner shares it instead of recomputing.
-        shared_uv: Optional[torch.Tensor] = None
+        uv_for_refiner: Optional[torch.Tensor] = None
         for level in range(5):
             uv = normalized_view_plane_uv(width=base_w * 2 ** level, height=base_h * 2 ** level, aspect_ratio=aspect_ratio, dtype=dtype, device=device)
             if level == 4:
-                shared_uv = uv
+                uv_for_refiner = uv
             uv = uv.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
 
             if features[level] is None:
@@ -198,7 +192,7 @@ class MoGeModel(MoGeModelV2):
                     coord_for_refiner = current_points.detach()
                     feature_for_refiner = refiner_feature.detach() if refiner_detach_backbone else refiner_feature
                     refined_logz, delta_z = self._refine_logz(
-                        coord_for_refiner, feature_for_refiner, shared_uv, return_delta_z=return_delta_z and not points_only,
+                        coord_for_refiner, feature_for_refiner, uv_for_refiner, return_delta_z=return_delta_z,
                     )
                     coord_for_update = current_points.detach() if detach_refine_coords else current_points
                     current_points = self._refine_coord_to_points(coord_for_update, refined_logz)
