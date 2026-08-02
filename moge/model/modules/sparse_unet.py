@@ -44,7 +44,6 @@ class Sparse3DUNet(nn.Module):
         bottleneck_blocks: int = 1,
         downsample_factors: Optional[List[int]] = None,
         encoder_downsample: int = 16,
-        encoder_proj: Literal['linear', 'res'] = 'res',
         use_checkpoint: bool = False,
         **deprecated_kwargs,
     ):
@@ -53,8 +52,6 @@ class Sparse3DUNet(nn.Module):
             print(f"Warning: Sparse3DUNet got unexpected kwargs: {deprecated_kwargs}")
         if len(model_channels) < 2:
             raise ValueError(f"model_channels must have at least 2 levels, got {model_channels}")
-        if encoder_proj not in ['linear', 'res']:
-            raise ValueError(f"Invalid encoder_proj: {encoder_proj}")
         if downsample_factors is None:
             downsample_factors = [2] * (len(model_channels) - 1)
         if len(downsample_factors) != len(model_channels) - 1:
@@ -70,7 +67,6 @@ class Sparse3DUNet(nn.Module):
         self.downsample_factors = downsample_factors
         assert self.encoder_downsample == math.prod(self.downsample_factors), \
             f"encoder_downsample ({self.encoder_downsample}) must equal the product of downsample_factors ({math.prod(self.downsample_factors)})"
-        self.encoder_proj = encoder_proj
 
         encoder_block_counts = self._resolve_blocks_per_level(
             encoder_blocks_per_level, len(model_channels), 'encoder_blocks_per_level'
@@ -92,7 +88,7 @@ class Sparse3DUNet(nn.Module):
         self.downsample_blocks = nn.ModuleList()
         for i, ch in enumerate(model_channels):
             self.down_stages.append(
-                self._make_stage(ch, encoder_block_counts[i], encoder_proj=self.encoder_proj)
+                self._make_stage(ch, encoder_block_counts[i])
             )
             if i < len(model_channels) - 1:
                 self.downsample_blocks.append(
@@ -104,7 +100,7 @@ class Sparse3DUNet(nn.Module):
                 )
 
         self.bottleneck_stage = self._make_stage(
-            model_channels[-1], bottleneck_blocks, encoder_proj='res'
+            model_channels[-1], bottleneck_blocks
         )
 
         self.upsample_blocks = nn.ModuleList()
@@ -120,7 +116,7 @@ class Sparse3DUNet(nn.Module):
                 )
             )
             self.up_stages.append(
-                self._make_stage(model_channels[target_level], decoder_block_counts[i], encoder_proj='res')
+                self._make_stage(model_channels[target_level], decoder_block_counts[i])
             )
 
         self.out_proj = zero_module(nn.Linear(model_channels[0], out_channels))
@@ -142,18 +138,11 @@ class Sparse3DUNet(nn.Module):
             raise ValueError(f"{name} must be non-negative, got {blocks_per_level}")
         return list(blocks_per_level)
 
-    def _make_stage(self, channels: int, num_blocks: int, encoder_proj: Literal['linear', 'res']) -> nn.ModuleList:
-        if encoder_proj == 'res':
-            return nn.ModuleList([
-                SparseResBlock3d(channels)
-                for _ in range(num_blocks)
-            ])
-        if encoder_proj == 'linear':
-            return nn.ModuleList([
-                PointwiseBlock(channels, channels)
-                for _ in range(num_blocks)
-            ])
-        raise ValueError(f"Invalid encoder_proj: {encoder_proj}")
+    def _make_stage(self, channels: int, num_blocks: int) -> nn.ModuleList:
+        return nn.ModuleList([
+            SparseResBlock3d(channels)
+            for _ in range(num_blocks)
+        ])
 
     def enable_gradient_checkpointing(self):
         for module in self.modules():
@@ -208,8 +197,7 @@ class Sparse3DUNet(nn.Module):
         feats = self.input_proj(feats)
         shape = torch.Size([*shape[:4], feats.shape[-1]])
 
-        # Cache layout (same convention as sparse_unet_5): each kind of
-        # neighbor cache lives in its own per-index list.
+        # Cache layout: each kind of neighbor cache lives in its own per-index list.
         #
         #   level_conv_caches[k]   -- submanifold-conv neighborhood at level k.
         #                             Coords at level k are identical between
