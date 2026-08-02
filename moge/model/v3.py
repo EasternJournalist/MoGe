@@ -217,14 +217,9 @@ class MoGeModel(MoGeModelV2):
         force_projection: bool = True,
         apply_mask: Literal[False, True, 'blend'] = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
-        precision: Literal['fp16', 'bf16', 'fp32'] = 'fp32',
         refine_steps: int = 3,
-        use_fp16: bool = False, # for compatibility
+        use_fp16: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        if use_fp16:
-            print("Warning: use_fp16 is deprecated, please use precision='fp16' instead. Precision will be set to FP16.")
-            precision = 'fp16'
-
         if image.dim() == 3:
             omit_batch_dim = True
             image = image.unsqueeze(0)
@@ -239,12 +234,7 @@ class MoGeModel(MoGeModelV2):
             min_tokens, max_tokens = self.num_tokens_range
             num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
 
-        dtype = None
-        if precision == 'fp16':
-            dtype = torch.float16
-        elif precision == 'bf16':
-            dtype = torch.bfloat16
-        with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=dtype is not None):
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_fp16 and self.dtype != torch.float16):
             output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps)
         points_all, normal, mask, metric_scale = (output.get(k, None) for k in ['points_all', 'normal', 'mask', 'metric_scale'])
 
