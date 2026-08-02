@@ -15,8 +15,10 @@ import utils3d
 from huggingface_hub import hf_hub_download
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, angle_diff_vec3
-from .utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
-from .modules import DINOv2Encoder, MLP, ConvStack
+from .utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+from .modules.dinov2_encoder import DINOv2Encoder
+from .modules.mlp import MLP
+from .modules.conv_stack import ConvStack
 
     
 class MoGeModel(nn.Module):
@@ -115,9 +117,6 @@ class MoGeModel(nn.Module):
         for head in ['points_head', 'normal_head', 'mask_head']:
             if hasattr(self, head):
                 getattr(self, head).enable_gradient_checkpointing()
-
-    def enable_pytorch_native_sdpa(self):
-        self.encoder.enable_pytorch_native_sdpa()
 
     def _remap_points(self, points: torch.Tensor) -> torch.Tensor:
         if self.remap_output == 'linear':

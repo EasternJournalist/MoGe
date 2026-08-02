@@ -7,7 +7,7 @@ import utils3d
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift
 from .v2 import MoGeModel as MoGeModelV2
-from .modules import Sparse3DUNet
+from .modules.sparse_unet import Sparse3DUNet
 
 
 class MoGeModel(MoGeModelV2):

@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..dinov2.models.vision_transformer import DinoVisionTransformer
-from ..utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+from .dinov2.models.vision_transformer import DinoVisionTransformer
+from ..utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
 
 
 class DINOv2Encoder(nn.Module):
@@ -23,7 +23,7 @@ class DINOv2Encoder(nn.Module):
         self.intermediate_layers = intermediate_layers
 
         # Load the backbone
-        self.hub_loader = getattr(importlib.import_module("..dinov2.hub.backbones", __package__), backbone)
+        self.hub_loader = getattr(importlib.import_module(".dinov2.hub.backbones", __package__), backbone)
         self.backbone_name = backbone
         self.backbone = self.hub_loader(pretrained=False)
 
@@ -54,10 +54,6 @@ class DINOv2Encoder(nn.Module):
     def enable_gradient_checkpointing(self):
         for i in range(len(self.backbone.blocks)):
             wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
-
-    def enable_pytorch_native_sdpa(self):
-        for i in range(len(self.backbone.blocks)):
-            wrap_dinov2_attention_with_sdpa(self.backbone.blocks[i].attn)
 
     def forward(self, image: torch.Tensor, token_rows: Union[int, torch.LongTensor], token_cols: Union[int, torch.LongTensor], return_class_token: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         image_14 = F.interpolate(image, (token_rows * 14, token_cols * 14), mode="bilinear", align_corners=False, antialias=not self.onnx_compatible_mode)

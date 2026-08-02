@@ -278,7 +278,7 @@ See [docs/eval.md](docs/eval.md)
 
 ## ⚖️ License
 
-MoGe code is released under the MIT license, except for DINOv2 code in `moge/model/dinov2` which is released by Meta AI under the Apache 2.0 license. 
+MoGe code is released under the MIT license, except for DINOv2 code in `moge/model/modules/dinov2` which is released by Meta AI under the Apache 2.0 license. 
 See [LICENSE](LICENSE) for more details.
 
 
