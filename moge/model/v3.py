@@ -117,11 +117,10 @@ class MoGeModel(MoGeModelV2):
         self,
         image: torch.Tensor,
         num_tokens: Union[int, torch.LongTensor],
-        refine_steps: int = 0,
+        refine_steps: int = 3,
         refiner_detach_backbone: bool = True,
         detach_refine_coords: bool = False,
         return_delta_z: bool = False,
-        points_only: bool = False,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, img_h, img_w = image.shape
         device, dtype = image.device, image.dtype
@@ -151,15 +150,10 @@ class MoGeModel(MoGeModelV2):
         neck_features = self.neck(features)
 
         raw_points = self.points_head(neck_features)[-1] if hasattr(self, 'points_head') else None
-        # infer_fast consumes only points + metric_scale, so it passes points_only=True to skip
-        # the normal/mask heads and their full-res upsampling (pure waste there).
-        if points_only:
-            normal = mask  = None
-        else:
-            normal, mask = (
-                getattr(self, head)(neck_features)[-1] if hasattr(self, head) else None
-                for head in ['normal_head', 'mask_head']
-            )
+        normal, mask = (
+            getattr(self, head)(neck_features)[-1] if hasattr(self, head) else None
+            for head in ['normal_head', 'mask_head']
+        )
         metric_scale = self.scale_head(cls_token) if hasattr(self, 'scale_head') else None
 
         resize_fn = lambda x: F.interpolate(x, (img_h, img_w), mode='bilinear', align_corners=False, antialias=False)
@@ -178,28 +172,21 @@ class MoGeModel(MoGeModelV2):
         points_all: List[torch.Tensor] = []
         delta_z_all: List[torch.Tensor] = []
         if raw_points is not None: # raw_points is B3HW at (x/z, y/z, logz)
-            # infer_fast (points_only) needs only the final point map; intermediate steps
-            # skip the full-res upsample/remap. The refiner loop runs on the low-res
-            # `current_points`, so the math of the final map is unaffected.
-            if not points_only or refine_steps == 0:
-                points_all.append(postprocess_points(raw_points, hwc=False, resize=True))
+            points_all.append(postprocess_points(raw_points, hwc=False, resize=True))
 
             if refine_steps > 0:
-                refiner_feature = features[0]
+                refiner_feature: torch.Tensor = features[0]
 
                 current_points = raw_points.permute(0, 2, 3, 1) # BHW3 at (x/z, y/z, logz)
-                for step in range(refine_steps):
+                for _ in range(refine_steps):
                     coord_for_refiner = current_points.detach()
                     feature_for_refiner = refiner_feature.detach() if refiner_detach_backbone else refiner_feature
                     refined_logz, delta_z = self._refine_logz(
                         coord_for_refiner, feature_for_refiner, uv_for_refiner, return_delta_z=return_delta_z,
                     )
-                    coord_for_update = current_points.detach() if detach_refine_coords else current_points
-                    current_points = self._refine_coord_to_points(coord_for_update, refined_logz)
-                    # points_only: keep only the final step's full-res point map.
-                    if not points_only or step == refine_steps - 1:
-                        points_all.append(postprocess_points(current_points, hwc=True, resize=True))
-                    if return_delta_z and not points_only:
+                    current_points = self._refine_coord_to_points(coord_for_refiner, refined_logz)
+                    points_all.append(postprocess_points(current_points, hwc=True, resize=True))
+                    if return_delta_z:
                         delta_z_all.append(delta_z)
 
         if normal is not None:
@@ -229,7 +216,6 @@ class MoGeModel(MoGeModelV2):
         resolution_level: int = 9,
         force_projection: bool = True,
         apply_mask: Literal[False, True, 'blend'] = True,
-        refine_with_normal: bool = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
         precision: Literal['fp16', 'bf16', 'fp32'] = 'fp32',
         refine_steps: int = 3,
@@ -356,100 +342,5 @@ class MoGeModel(MoGeModelV2):
                 k: [item.squeeze(0) for item in v] if isinstance(v, list) else v.squeeze(0)
                 for k, v in return_dict.items()
             }
-
-        return return_dict
-
-    @torch.inference_mode()
-    def infer_fast(
-        self,
-        image: torch.Tensor,
-        num_tokens: int = None,
-        resolution_level: int = 9,
-        force_projection: bool = False,
-        apply_mask: Literal[False, True, 'blend'] = False,
-        refine_with_normal: bool = True,
-        fov_x: Optional[Union[Number, torch.Tensor]] = None,
-        precision: Literal['fp16', 'bf16', 'fp32'] = 'fp16',
-        refine_steps: int = 3,
-        use_fp16: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Fast variant of `infer`: only the final refined point map is post-processed.
-
-        Differences from `infer`:
-        - Focal/shift recovery is performed only on `points_all[-1]` (skipping all
-          intermediate refinement steps).
-        - Per-step outputs (`points_all`, `depth_all`, `intrinsics_all`)
-          are not produced/returned.
-        Interface matches `infer` exactly.
-        """
-        if use_fp16:
-            print("Warning: use_fp16 is deprecated, please use precision='fp16' instead. Precision will be set to FP16.")
-            precision = 'fp16'
-
-        if image.dim() == 3:
-            omit_batch_dim = True
-            image = image.unsqueeze(0)
-        else:
-            omit_batch_dim = False
-        image = image.to(dtype=self.dtype, device=self.device)
-
-        original_height, original_width = image.shape[-2:]
-        aspect_ratio = original_width / original_height
-
-        if num_tokens is None:
-            min_tokens, max_tokens = self.num_tokens_range
-            num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
-
-        dtype = None
-        if precision == 'fp16':
-            dtype = torch.float16
-        elif precision == 'bf16':
-            dtype = torch.bfloat16
-        with torch.autocast(device_type=self.device.type, dtype=dtype, enabled=dtype is not None):
-            output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps, points_only=True)
-        points_all, metric_scale = (output.get(k, None) for k in ['points_all', 'metric_scale'])
-
-        # Keep only the last refined point map; drop intermediate per-step outputs.
-        points = points_all[-1].float() if points_all is not None else None
-        metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [metric_scale, fov_x])
-        with torch.autocast(device_type=self.device.type, dtype=torch.float32):
-            if points is not None:
-                from ..utils.geometry_torch import recover_focal_shift
-
-                # Solve (focal, shift) only on the final-step point map.
-                if fov_x is None:
-                    focal, shift = recover_focal_shift(points, None)
-                else:
-                    focal = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points.device, dtype=points.dtype) / 2))
-                    if focal.ndim == 0:
-                        focal = focal[None].expand(points.shape[0])
-                    _, shift = recover_focal_shift(points, None, focal=focal)
-                fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
-                intrinsics = utils3d.pt.intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
-
-                points = points.clone()
-                points[..., 2] += shift[..., None, None]
-
-                depth = points[..., 2].clone()
-
-                if force_projection:
-                    points = utils3d.pt.depth_map_to_point_map(depth, intrinsics=intrinsics)
-
-                if metric_scale is not None:
-                    points = points * metric_scale[:, None, None, None]
-                    depth = depth * metric_scale[:, None, None]
-            else:
-                points, depth, intrinsics = None, None, None
-
-        return_dict = {
-            'points': points,
-            'intrinsics': intrinsics,
-            'depth': depth,
-        }
-        return_dict = {k: v for k, v in return_dict.items() if v is not None}
-
-        if omit_batch_dim:
-            return_dict = {k: v.squeeze(0) for k, v in return_dict.items()}
 
         return return_dict
