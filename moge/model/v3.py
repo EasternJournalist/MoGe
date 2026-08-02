@@ -53,7 +53,7 @@ class MoGeModel(MoGeModelV2):
             unwrap_module(self.refiner)
         wrap_module_with_autocast(self.refiner, device_type='cuda', dtype=dtype)
 
-    def _refine_coord_to_points(self, old_coord: torch.Tensor, new_logz: torch.Tensor) -> torch.Tensor:
+    def _replace_logz(self, old_coord: torch.Tensor, new_logz: torch.Tensor) -> torch.Tensor:
         uv = old_coord[..., :2]
         return torch.cat([uv, new_logz.unsqueeze(-1)], dim=-1)
 
@@ -159,7 +159,7 @@ class MoGeModel(MoGeModelV2):
         neck_features = self.neck(features)
 
         # Heads decoding
-        raw_points = self.points_head(neck_features)[-1] if hasattr(self, 'points_head') else None
+        raw_coord = self.points_head(neck_features)[-1] if hasattr(self, 'points_head') else None
         normal, mask = (
             getattr(self, head)(neck_features)[-1] if hasattr(self, head) else None
             for head in ['normal_head', 'mask_head']
@@ -170,36 +170,36 @@ class MoGeModel(MoGeModelV2):
         resize_fn = lambda x: F.interpolate(x, (img_h, img_w), mode='bilinear', align_corners=False, antialias=False)
         normal, mask = (resize_fn(x) if x is not None else None for x in [normal, mask])
 
-        def postprocess_points(points: torch.Tensor, hwc: bool, resize: bool) -> torch.Tensor:
+        def coord_to_points(coord: torch.Tensor, hwc: bool, resize: bool) -> torch.Tensor:
             # input is BHW3 or B3HW at (x/z, y/z, logz). Output is BHW3 at (x, y, z).
             if hwc: # input is BHW3
-                points = points.permute(0, 3, 1, 2) # to B3HW
+                coord = coord.permute(0, 3, 1, 2) # to B3HW
             if resize:
-                points = resize_fn(points)
-            points = points.permute(0, 2, 3, 1) # to BHW3
-            points = self._remap_points(points) # BHW3 at (x, y, z)
+                coord = resize_fn(coord)
+            coord = coord.permute(0, 2, 3, 1) # to BHW3
+            points = self._remap_points(coord) # BHW3 at (x, y, z)
             return points
 
         # Process points and optionally refine them
-        points_all: List[torch.Tensor] = []
-        delta_z_all: List[torch.Tensor] = []
-        if raw_points is not None: # raw_points is B3HW at (x/z, y/z, logz)
-            points_all.append(postprocess_points(raw_points, hwc=False, resize=True))
+        points_per_step: List[torch.Tensor] = []
+        delta_z_per_update: List[torch.Tensor] = []
+        if raw_coord is not None: # raw_coord is B3HW at (x/z, y/z, logz)
+            points_per_step.append(coord_to_points(raw_coord, hwc=False, resize=True))
 
             if refine_steps > 0:
                 refiner_feature: torch.Tensor = features[0]
 
-                current_points = raw_points.permute(0, 2, 3, 1).float() # BHW3 at (x/z, y/z, logz)
+                current_coord = raw_coord.permute(0, 2, 3, 1).float() # BHW3 at (x/z, y/z, logz)
                 for _ in range(refine_steps):
-                    coord_for_refiner = current_points.detach()
+                    coord_for_refiner = current_coord.detach()
                     feature_for_refiner = refiner_feature.detach() if refiner_detach_backbone else refiner_feature
                     refined_logz, delta_z = self._refine_logz(
                         coord_for_refiner, feature_for_refiner, uv_for_refiner, return_delta_z=return_delta_z,
                     )
-                    current_points = self._refine_coord_to_points(coord_for_refiner, refined_logz)
-                    points_all.append(postprocess_points(current_points, hwc=True, resize=True))
+                    current_coord = self._replace_logz(coord_for_refiner, refined_logz)
+                    points_per_step.append(coord_to_points(current_coord, hwc=True, resize=True))
                     if return_delta_z:
-                        delta_z_all.append(delta_z)
+                        delta_z_per_update.append(delta_z)
 
         # Remap
         if normal is not None:
@@ -210,9 +210,10 @@ class MoGeModel(MoGeModelV2):
         if metric_scale is not None:
             metric_scale = metric_scale.squeeze(1).exp()
 
+        # `delta_z_per_update` has one entry fewer than `points_per_step`: entry i is the update from step i to i+1.
         return_dict = {
-            'points_all': points_all if len(points_all) > 0 else None,
-            'delta_z_all': delta_z_all if len(delta_z_all) > 0 else None,
+            'points_per_step': points_per_step if len(points_per_step) > 0 else None,
+            'delta_z_per_update': delta_z_per_update if len(delta_z_per_update) > 0 else None,
             'normal': normal,
             'mask': mask,
             'metric_scale': metric_scale,
@@ -254,10 +255,10 @@ class MoGeModel(MoGeModelV2):
         # Forward pass
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_fp16 and self.dtype != torch.float16):
             output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps)
-        points_all, normal, mask, metric_scale = (output.get(k, None) for k in ['points_all', 'normal', 'mask', 'metric_scale'])
+        affine_points_per_step, normal, mask, metric_scale = (output.get(k, None) for k in ['points_per_step', 'normal', 'mask', 'metric_scale'])
 
         # Always process the output in fp32 precision
-        points_all = [p.float() for p in points_all] if points_all is not None else None
+        affine_points_per_step = [p.float() for p in affine_points_per_step] if affine_points_per_step is not None else None
         normal, mask, metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [normal, mask, metric_scale, fov_x])
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):
             if mask is not None:
@@ -265,30 +266,29 @@ class MoGeModel(MoGeModelV2):
             else:
                 mask_binary = None
 
-            if points_all is not None:
+            if affine_points_per_step is not None:
                 # Per-step (focal, shift) recovery: refinement modifies logz which changes
                 # the 3D shape, so focal recovered from each step's point map differs.
                 # Jointly solving (focal, shift) on the same point map gives the optimal
                 # affine->camera alignment for that step (matches v2_4's single-step logic).
-                points_ref = points_all[-1]
                 if fov_x is not None:
-                    focal_fixed = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=points_ref.device, dtype=points_ref.dtype) / 2))
+                    focal_fixed = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(torch.as_tensor(fov_x, device=self.device, dtype=torch.float32) / 2))
                     if focal_fixed.ndim == 0:
-                        focal_fixed = focal_fixed[None].expand(points_ref.shape[0])
+                        focal_fixed = focal_fixed[None].expand(affine_points_per_step[-1].shape[0])
                 else:
                     focal_fixed = None
 
-                points_all_processed, depth_all, intrinsics_all = [], [], []
-                for points in points_all:
+                points_per_step, depth_per_step, intrinsics_per_step = [], [], []
+                for affine_points in affine_points_per_step:
                     if focal_fixed is None:
-                        focal_i, shift_i = recover_focal_shift(points, mask_binary)
+                        focal_i, shift_i = recover_focal_shift(affine_points, mask_binary)
                     else:
                         focal_i = focal_fixed
-                        _, shift_i = recover_focal_shift(points, mask_binary, focal=focal_i)
+                        _, shift_i = recover_focal_shift(affine_points, mask_binary, focal=focal_i)
                     fx_i, fy_i = focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal_i / 2 * (1 + aspect_ratio ** 2) ** 0.5
                     intrinsics_i = utils3d.pt.intrinsics_from_focal_center(fx_i, fy_i, 0.5, 0.5)
 
-                    points = points.clone()
+                    points = affine_points.clone()
                     points[..., 2] += shift_i[..., None, None]
                     depth = points[..., 2].clone()
 
@@ -299,47 +299,46 @@ class MoGeModel(MoGeModelV2):
                         points *= metric_scale[:, None, None, None]
                         depth *= metric_scale[:, None, None]
 
-                    points_all_processed.append(points)
-                    depth_all.append(depth)
-                    intrinsics_all.append(intrinsics_i)
+                    points_per_step.append(points)
+                    depth_per_step.append(depth)
+                    intrinsics_per_step.append(intrinsics_i)
 
                 # Final intrinsics correspond to the final-step point map (the one used as
                 # the canonical output `points` / `depth`).
-                intrinsics = intrinsics_all[-1]
+                intrinsics = intrinsics_per_step[-1]
 
                 # Build per-step masks so each step is self-consistently masked
                 # against its own depth>0 (mirrors v2_4's `mask_binary &= points[..., 2] > 0`).
                 if mask_binary is not None:
-                    per_step_masks = [mask_binary & (d > 0) for d in depth_all]
-                    mask_binary = per_step_masks[-1]
+                    mask_per_step = [mask_binary & (d > 0) for d in depth_per_step]
+                    mask_binary = mask_per_step[-1]
                 else:
-                    per_step_masks = None
+                    mask_per_step = None
 
-                points_all = points_all_processed
-                points = points_all[-1]
-                depth = depth_all[-1]
+                points = points_per_step[-1]
+                depth = depth_per_step[-1]
             else:
-                points_all = None
-                depth_all = None
-                intrinsics_all = None
-                per_step_masks = None
+                points_per_step = None
+                depth_per_step = None
+                intrinsics_per_step = None
+                mask_per_step = None
                 points, depth, intrinsics = None, None, None
 
             if apply_mask:
-                if per_step_masks is not None:
-                    points_all = [torch.where(m[..., None], p, torch.inf) for p, m in zip(points_all, per_step_masks)]
-                    depth_all  = [torch.where(m, d, torch.inf) for d, m in zip(depth_all, per_step_masks)]
-                    points, depth = points_all[-1], depth_all[-1]
+                if mask_per_step is not None:
+                    points_per_step = [torch.where(m[..., None], p, torch.inf) for p, m in zip(points_per_step, mask_per_step)]
+                    depth_per_step  = [torch.where(m, d, torch.inf) for d, m in zip(depth_per_step, mask_per_step)]
+                    points, depth = points_per_step[-1], depth_per_step[-1]
                 if mask_binary is not None and normal is not None:
                     normal = torch.where(mask_binary[..., None], normal, torch.zeros_like(normal))
 
         return_dict = {
             'points': points,
-            'points_all': points_all,
+            'points_per_step': points_per_step,
             'intrinsics': intrinsics,
-            'intrinsics_all': intrinsics_all,
+            'intrinsics_per_step': intrinsics_per_step,
             'depth': depth,
-            'depth_all': depth_all,
+            'depth_per_step': depth_per_step,
             'mask': mask_binary,
             'normal': normal,
         }
