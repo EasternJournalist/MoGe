@@ -12,10 +12,6 @@ from flex_gemm.nn import (
     SubmanifoldConv3d,
     SparsePool3d,
     SparseUpsample3d,
-    SparsePixelShuffle3d,
-    SparsePixelShuffle,
-    SparsePixelUnshuffle3d,
-    SparsePixelUnshuffle,
 )
 
 
@@ -103,43 +99,6 @@ class SparseResBlock3d(nn.Module):
                 use_reentrant=False,
             )
         return self._forward(feats, coords, shape, neighbor_cache)
-
-
-class PixelUnshuffleDown(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, factor_tuple: Tuple[int, ...]):
-        super().__init__()
-        ch_factor = math.prod(factor_tuple)
-        if len(set(factor_tuple)) == 1:
-            self.unshuffle = SparsePixelUnshuffle3d(factor_tuple[0])
-        else:
-            self.unshuffle = SparsePixelUnshuffle(factor_tuple)
-        self.linear = nn.Linear(in_ch * ch_factor, out_ch)
-
-    def forward(self, feats, coords, shape):
-        feats, coords, shape, down_cache = self.unshuffle(feats, coords, shape)
-        feats = self.linear(feats)
-        return feats, coords, _with_channels(shape, feats.shape[-1]), down_cache
-
-
-class PixelShuffleUp(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, factor_tuple: Tuple[int, ...]):
-        super().__init__()
-        ch_factor = math.prod(factor_tuple)
-        self.linear = nn.Linear(in_ch, out_ch * ch_factor)
-        if len(set(factor_tuple)) == 1:
-            self.shuffle = SparsePixelShuffle3d(factor_tuple[0])
-        else:
-            self.shuffle = SparsePixelShuffle(factor_tuple)
-
-    def forward(self, feats, coords, shape, target_coords, target_shape, up_cache=None):
-        feats = self.linear(feats)
-        shape = _with_channels(shape, feats.shape[-1])
-        feats, coords, shape, _ = self.shuffle(
-            feats, coords, shape,
-            output_coords=target_coords, output_shape=target_shape,
-            neighbor_cache=up_cache,
-        )
-        return feats, coords, shape
 
 
 class PoolDown(nn.Module):

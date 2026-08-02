@@ -9,8 +9,6 @@ from .utils import zero_module
 from .flex_sparse_blocks import (
     PointwiseBlock,
     SparseResBlock3d,
-    PixelUnshuffleDown,
-    PixelShuffleUp,
     PoolDown,
     NearestUp,
 )
@@ -92,11 +90,9 @@ class Sparse3DUNet(nn.Module):
             )
             if i < len(model_channels) - 1:
                 self.downsample_blocks.append(
-                    self.get_downsample_block(
-                        in_channel=model_channels[i],
-                        out_channel=model_channels[i + 1],
-                        downsample_factor=self.downsample_factors[i],
-                    )
+                    PoolDown(model_channels[i], 
+                             model_channels[i + 1], 
+                             self.downsample_factors[i])
                 )
 
         self.bottleneck_stage = self._make_stage(
@@ -109,11 +105,9 @@ class Sparse3DUNet(nn.Module):
             source_level = len(model_channels) - 1 - i
             target_level = source_level - 1
             self.upsample_blocks.append(
-                self.get_upsample_block(
-                    channels=model_channels[source_level],
-                    out_channels=model_channels[target_level],
-                    upsample_factor=self.downsample_factors[target_level],
-                )
+                NearestUp(model_channels[source_level], 
+                          model_channels[target_level],
+                          self.downsample_factors[target_level])
             )
             self.up_stages.append(
                 self._make_stage(model_channels[target_level], decoder_block_counts[i])
@@ -150,22 +144,6 @@ class Sparse3DUNet(nn.Module):
                 continue
             if hasattr(module, 'use_checkpoint'):
                 module.use_checkpoint = True
-
-    def get_downsample_block(
-        self,
-        in_channel: int,
-        out_channel: int,
-        downsample_factor: int,
-    ) -> nn.Module:
-        return PoolDown(in_channel, out_channel, downsample_factor)
-
-    def get_upsample_block(
-        self,
-        channels: int,
-        out_channels: int,
-        upsample_factor: int,
-    ) -> nn.Module:
-        return NearestUp(channels, out_channels, upsample_factor)
 
     def _sample_encoder_feature(
         self,
