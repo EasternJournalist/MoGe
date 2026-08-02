@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from .flex_sparse_blocks import (
-    PointwiseBlock,
     SparseResBlock3d,
     PoolDown,
     NearestUp,

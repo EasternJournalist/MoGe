@@ -46,16 +46,6 @@ def _ceil_downsample_shape(shape: torch.Size, sparse_dim: int, factor: int) -> t
     return torch.Size([*sparse_shape, *dense_shape])
 
 
-class PointwiseBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.linear = nn.Linear(in_ch, out_ch)
-        self.act = nn.SiLU()
-
-    def forward(self, feats, coords, shape, neighbor_cache=None):
-        return self.act(self.linear(feats)), neighbor_cache
-
-
 class SparseResBlock3d(nn.Module):
     def __init__(self, channels: int, out_channels: int = None):
         super().__init__()
