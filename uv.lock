@@ -310,7 +310,7 @@ wheels = [
 [[package]]
 name = "flex-gemm"
 version = "1.0.0"
-source = { git = "https://github.com/kooWZ/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf#b2fadb29d41846c7981ade6801ffc689fae119cf" }
+source = { git = "https://github.com/JeffreyXiang/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf#b2fadb29d41846c7981ade6801ffc689fae119cf" }
 dependencies = [
     { name = "filelock" },
     { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "extra == 'extra-4-moge-cu128'" },
@@ -859,8 +859,8 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'cu128'", specifier = ">=1.12.0" },
     { name = "accelerate", marker = "extra == 'cu130'", specifier = ">=1.12.0" },
     { name = "click", specifier = ">=8.3.1" },
-    { name = "flex-gemm", marker = "extra == 'cu128'", git = "https://github.com/kooWZ/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf" },
-    { name = "flex-gemm", marker = "extra == 'cu130'", git = "https://github.com/kooWZ/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf" },
+    { name = "flex-gemm", marker = "extra == 'cu128'", git = "https://github.com/JeffreyXiang/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf" },
+    { name = "flex-gemm", marker = "extra == 'cu130'", git = "https://github.com/JeffreyXiang/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf" },
     { name = "gitpython", marker = "extra == 'train'", specifier = ">=3.1.43" },
     { name = "gradio" },
     { name = "ipykernel", marker = "extra == 'dev'" },
