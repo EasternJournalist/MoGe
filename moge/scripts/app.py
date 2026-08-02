@@ -64,7 +64,7 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
                 pass
         def _wait_and_delete():
             time.sleep(delay)
-            _delete(path)
+            _delete()
         thread_pool_executor.submit(_wait_and_delete)
         atexit.register(_delete)
 

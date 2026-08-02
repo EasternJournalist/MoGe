@@ -215,7 +215,7 @@ def build_viewer_html(config: Dict[str, Any], height: str = '60vh') -> str:
 
 @click.command(help='Web demo')
 @click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='The name or path of the pre-trained model.')
+@click.option('--pretrained', 'pretrained_model_name_or_path', required=True, help='The name or path of the pre-trained model.')
 @click.option('--fp16', 'use_fp16', is_flag=True, help='Whether to use fp16 inference.')
 def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
     print("Import modules...")
