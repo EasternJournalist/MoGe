@@ -22,7 +22,6 @@ class MoGeModel(MoGeModelV2):
         remap_output: Literal['linear', 'sinh', 'exp', 'sinh_exp'] = 'linear',
         num_tokens_range: List[int] = [1200, 3600],
         refiner: Optional[Dict[str, Any]] = None,
-        refine_feature_level: int = 0,
         **deprecated_kwargs,
     ):
         super().__init__(
@@ -37,14 +36,13 @@ class MoGeModel(MoGeModelV2):
             **deprecated_kwargs,
         )
         self.encoder_patch_size: int = self.encoder.backbone.patch_size
-        self.refine_feature_level = refine_feature_level
 
         if refiner is not None:
             refiner_cfg = dict(refiner)
             self.refiner_depth_resolution: float = refiner_cfg.pop('depth_resolution', 256)
-            self.refiner = Sparse3DUNet(in_channels=3, out_channels=1, **refiner_cfg)
+            self.refiner = Sparse3DUNet(**refiner_cfg)
         else:
-            print("Warning: refiner is not initialized.")
+            print("Warning: refiner is not enabled.")
 
     def enable_refiner_gradient_checkpointing(self):
         self.refiner.enable_gradient_checkpointing()
@@ -193,7 +191,7 @@ class MoGeModel(MoGeModelV2):
                 points_all.append(postprocess_points(raw_points, hwc=False, resize=True))
 
             if refine_steps > 0:
-                refiner_feature = features[self.refine_feature_level]
+                refiner_feature = features[0]
 
                 current_points = raw_points.permute(0, 2, 3, 1) # BHW3 at (x/z, y/z, logz)
                 for step in range(refine_steps):
