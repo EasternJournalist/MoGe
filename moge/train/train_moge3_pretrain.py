@@ -36,6 +36,7 @@ from .utils import (
     append_group_log_dict,
     append_group_log_value,
     cleanup_old_rolling_ckpts,
+    record_rolling_ckpt,
     detach_to_cpu,
     filter_outliers,
     group_loss_values,
@@ -842,9 +843,11 @@ def main(
             _is_final_ckpt = (i_step == num_iterations - 1)
             if accelerator.is_main_process and (_is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt):
                 save_ckpt()
-                # For rolling checkpoints, clean up old non-permanent checkpoints
+                # For rolling checkpoints, drop the previous rolling one. Record this step first
+                # so a crash before cleanup leaves it tracked rather than orphaned.
                 if _is_rolling_ckpt:
-                    save_checkpoint_executor.submit(cleanup_old_rolling_ckpts, workspace, checkpoint_every, i_step)
+                    record_rolling_ckpt(workspace, i_step)
+                    save_checkpoint_executor.submit(cleanup_old_rolling_ckpts, workspace, i_step)
 
             # Save data pipeline RNG state for all processes so data order can be resumed
             if _is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt:

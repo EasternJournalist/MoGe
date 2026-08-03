@@ -1,6 +1,5 @@
 from typing import *
 import fnmatch
-import re
 import time
 from pathlib import Path
 from numbers import Number
@@ -169,17 +168,49 @@ def get_raft_weight(total_step_count: int, step: int, gamma: float) -> float:
     return (gamma ** (total_step_count - 1 - step)) / weight_sum
 
 
-def cleanup_old_rolling_ckpts(workspace: Path, checkpoint_every: int, current_step: int):
+ROLLING_CKPT_MANIFEST = 'rolling_ckpts.json'
+
+
+def cleanup_old_rolling_ckpts(workspace: Path, current_step: int):
+    """Keep only `current_step` among the rolling checkpoints this workspace has written.
+
+    Rolling checkpoints are tracked in `checkpoint/rolling_ckpts.json` rather than inferred
+    from the step number. Inferring them (e.g. "any step not divisible by checkpoint_every")
+    also matches checkpoints written by another run or another training script that used a
+    different cadence, and silently deletes them. Only steps this workspace recorded as
+    rolling are ever removed; anything else found in the directory is left alone.
+
+    The manifest is written before the deletions so a crash mid-cleanup leaves stale files
+    to be collected next time rather than losing track of them.
+    """
     ckpt_dir = Path(workspace, 'checkpoint')
     if not ckpt_dir.exists():
         return
-    for f in ckpt_dir.iterdir():
-        m = re.match(r'^(\d{8})(?:_optimizer|_ema)?\.pt$', f.name)
-        if not m:
-            continue
-        step_num = int(m.group(1))
-        if step_num < current_step and step_num % checkpoint_every != 0:
-            f.unlink(missing_ok=True)
+    manifest_path = Path(ckpt_dir, ROLLING_CKPT_MANIFEST)
+
+    try:
+        tracked = set(json.loads(manifest_path.read_text())) if manifest_path.exists() else set()
+    except (json.JSONDecodeError, OSError, TypeError):
+        tracked = set()
+
+    stale = sorted(step for step in tracked if step != current_step)
+    manifest_path.write_text(json.dumps(sorted(tracked - set(stale) | {current_step})))
+
+    for step in stale:
+        for suffix in ('', '_optimizer', '_ema'):
+            Path(ckpt_dir, f'{step:08d}{suffix}.pt').unlink(missing_ok=True)
+
+
+def record_rolling_ckpt(workspace: Path, step: int):
+    """Add `step` to the rolling-checkpoint manifest, so a later cleanup may remove it."""
+    ckpt_dir = Path(workspace, 'checkpoint')
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(ckpt_dir, ROLLING_CKPT_MANIFEST)
+    try:
+        tracked = set(json.loads(manifest_path.read_text())) if manifest_path.exists() else set()
+    except (json.JSONDecodeError, OSError, TypeError):
+        tracked = set()
+    manifest_path.write_text(json.dumps(sorted(tracked | {step})))
 
 
 _OPTIMIZER_CONFIG_METADATA_KEYS = {'params', 'type', 'optimizer', 'optimizer_type', 'name'}

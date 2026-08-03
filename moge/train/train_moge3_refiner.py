@@ -35,6 +35,7 @@ from .utils import (
     build_lr_scheduler,
     to_device,
     cleanup_old_rolling_ckpts,
+    record_rolling_ckpt,
     detach_to_cpu,
     filter_outliers,
     get_raft_weight,
@@ -82,7 +83,6 @@ torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudn
 @click.option('--wandb_project', type=str, default='MoGe', help='Weights & Biases project name')
 @click.option('--max_invalid_batches', type=int, default=-1, help='Maximum number of all-invalid batches before abort; set to -1 to disable this check')
 @click.option('--find_unused_parameters', type=bool, default=True, help='Whether to set find_unused_parameters=True for DistributedDataParallel, which may be necessary if not all model parameters receive gradients in each iteration')
-@click.option('--save_abnormal_instance', type=bool, default=False, help='Whether to save training instances that cause NaN loss or non-finite gradient for further analysis')
 @click.option('--num_load_workers', type=int, default=4, help='Number of workers for loading data')
 @click.option('--num_process_workers', type=int, default=8, help='Number of workers for processing data')
 def main(
@@ -113,7 +113,6 @@ def main(
     wandb_project: str,
     max_invalid_batches: int,
     find_unused_parameters: bool,
-    save_abnormal_instance: bool,
     num_load_workers: int,
     num_process_workers: int,
 ):
@@ -359,59 +358,6 @@ def main(
             else:
                 print(f"Warning: No {_pipeline_name} data pipeline state found for rank {accelerator.process_index}, data ordering will restart from the beginning")
 
-    abnormal_saved_instances = 0
-    max_abnormal_instances = 25
-
-    def _save_abnormal_refine_instance(
-        image_batch: torch.Tensor,
-        pred_points_all_steps: List[torch.Tensor],
-        triggered_refine_steps: List[int],
-        triggered_delta_stats: Dict[int, Dict[str, float]],
-        step: int,
-        accumulate_step: int,
-        instance_idx: int,
-        instance_info: Any,
-    ):
-        nonlocal abnormal_saved_instances
-        if abnormal_saved_instances >= max_abnormal_instances:
-            return
-
-        if not triggered_refine_steps:
-            return
-
-        save_dir = Path(workspace, 'abnormal_instances').joinpath(
-            f'{abnormal_saved_instances:03d}_step_{step:08d}_accum_{accumulate_step:02d}_inst_{instance_idx:02d}_trigger_{triggered_refine_steps[0]:02d}'
-        )
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        image_np = image_batch[instance_idx].detach().float().clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
-        image_u8 = (image_np * 255).astype(np.uint8)
-        cv2.imwrite(str(save_dir.joinpath('image.jpg')), cv2.cvtColor(image_u8, cv2.COLOR_RGB2BGR))
-
-        all_points_np = np.stack([
-            points_step.detach().float().cpu().numpy() for points_step in pred_points_all_steps
-        ], axis=0)
-        np.save(save_dir.joinpath('refined_points.npy'), all_points_np)
-
-        with save_dir.joinpath('meta.json').open('w') as f:
-            json.dump(
-                {
-                    'step': step,
-                    'accumulate_step': accumulate_step,
-                    'instance_idx': instance_idx,
-                    'triggered_refine_steps': triggered_refine_steps,
-                    'triggered_delta_stats': triggered_delta_stats,
-                    'num_refine_steps': len(pred_points_all_steps),
-                    'process_index': accelerator.process_index,
-                    'info': instance_info,
-                },
-                f,
-                indent=2,
-                default=str,
-            )
-
-        abnormal_saved_instances += 1
-
     def _dump_debug_state(
         step: int,
         accumulate_step: int,
@@ -588,8 +534,6 @@ def main(
                                     step0_gt_metric_scale = None
                                     refine_step0_scale = None
                                     loss_dict, weight_dict, misc_dict, refine_stat_dict = {}, {}, {}, {}
-                                    abnormal_triggered_steps: List[int] = []
-                                    abnormal_delta_stats_by_step: Dict[int, Dict[str, float]] = {}
                                     is_refine_instance = label_type[i] == "D"
                                     radial_loss_cache: Optional[RadialPartitionLocalLossCache] = None
 
@@ -601,20 +545,6 @@ def main(
                                         if pred_step > 0:
                                             delta_stats = monitor_delta(delta_z_all[pred_step-1][i].detach())
                                             refine_stat_dict[f'delta_z_step_{pred_step}_'] = delta_stats
-                                            if (
-                                                save_abnormal_instance
-                                                and abnormal_saved_instances < max_abnormal_instances
-                                                and (
-                                                    delta_stats['std'] > 3
-                                                    or abs(delta_stats['mean']) > 2
-                                                )
-                                            ):
-                                                abnormal_triggered_steps.append(pred_step)
-                                                abnormal_delta_stats_by_step[pred_step] = {
-                                                    'mean': float(delta_stats['mean']),
-                                                    'std': float(delta_stats['std']),
-                                                }
-                                                print(f"Abnormal instance triggered at step {i_step}, accumulation {i_accumulate}, instance {i}, refine step {pred_step}. Batch info: {info}")
                                         for k, v in config['loss'][label_type[i]].get('points', {}).items():
                                             if pred_step not in v['apply_steps']:
                                                 continue
@@ -707,16 +637,7 @@ def main(
                                                 loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], step0_gt_metric_scale)
 
                                     if save_abnormal_instance and abnormal_triggered_steps and abnormal_saved_instances < max_abnormal_instances:
-                                        _save_abnormal_refine_instance(
-                                            image_batch=image,
-                                            pred_points_all_steps=pred_points_i,
-                                            triggered_refine_steps=abnormal_triggered_steps,
-                                            triggered_delta_stats=abnormal_delta_stats_by_step,
-                                            step=i_step,
-                                            accumulate_step=i_accumulate,
-                                            instance_idx=i,
-                                            instance_info=info[i],
-                                        )
+                                
 
                                     weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
                                     loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
@@ -1089,9 +1010,11 @@ def main(
             _is_final_ckpt = (i_step == num_iterations - 1)
             if accelerator.is_main_process and (_is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt):
                 save_ckpt()
-                # For rolling checkpoints, clean up old non-permanent checkpoints
+                # For rolling checkpoints, drop the previous rolling one. Record this step first
+                # so a crash before cleanup leaves it tracked rather than orphaned.
                 if _is_rolling_ckpt:
-                    save_checkpoint_executor.submit(cleanup_old_rolling_ckpts, workspace, checkpoint_every, i_step)
+                    record_rolling_ckpt(workspace, i_step)
+                    save_checkpoint_executor.submit(cleanup_old_rolling_ckpts, workspace, i_step)
 
             # Save data pipeline RNG state for all processes so data order can be resumed
             if _is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt:
