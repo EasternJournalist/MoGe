@@ -140,12 +140,12 @@ Here is a commented configuration for reference:
 
 ## Run Training 
 
-Launch the training script [`moge/train/train_moge2.py`](../moge/train/train_moge2.py) as a module from the repository root. Note that we use [`accelerate`](https://github.com/huggingface/accelerate) for distributed training. 
+Launch the training script [`moge/train/train_moge12.py`](../moge/train/train_moge12.py) as a module from the repository root. It trains both MoGe-1 and MoGe-2; which one you get is decided by `model_version` in the config. Note that we use [`accelerate`](https://github.com/huggingface/accelerate) for distributed training. 
 
 ```bash
 accelerate launch \
     --num_processes 8 \
-    --module moge.train.train_moge2 \
+    --module moge.train.train_moge12 \
     --config configs/train/v1.json \
     --workspace workspace/debug \
     --gradient_accumulation_steps 2 \
@@ -169,7 +169,7 @@ The settings in default configuration are not optimal for specific datasets and 
 ```bash
 accelerate launch \
     --num_processes 8 \
-    --module moge.train.train_moge2 \
+    --module moge.train.train_moge12 \
     --config configs/train/v1.json \
     --workspace workspace/debug \
     --gradient_accumulation_steps 2 \
