@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 import torch.types
 import utils3d
 
@@ -414,3 +415,76 @@ def align_affine_lstsq(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor = None)
     B = (w_sqrt * y)[..., None]
     a, b = torch.linalg.lstsq(A, B)[0].squeeze(-1).unbind(-1)
     return a, b
+
+def segment_robust_weighted_median(x: Tensor, w: Tensor, offsets: Tensor, trunc: Optional[Union[float, Tensor]] = None) -> Tuple[Tensor, Tensor]:
+    """
+    Get the median of `x` weighted by `w`, which is the solution to `min_t sum_i w_i * |t - x_i|`, within each segment.
+
+    ### Parameters:
+    - `x: Tensor` of shape `(..., N)`. Leading dimensions are batch dimensions. Last dimension is flattened segments.
+    - `w: Tensor` of shape `(..., N)`
+    - `offsets: Tensor` of shape `(M + 1)`, segment offsets applied to the last dimension of `x` and `w`.
+
+    ### Returns:
+    - `median_values: Tensor` of shape `(..., M)`, median values for each segment.
+    - `median_indices: Tensor` of shape `(..., M)`, indices of the median in `x` for each segment.
+    """
+    lengths = torch.diff(offsets)
+    seg_ids = torch.arange(len(lengths), device=x.device).repeat_interleave(lengths)
+
+    x, w = torch.broadcast_tensors(x, w)
+    batch_shape = x.shape[:-1]
+    batch_size = math.prod(batch_shape)
+    x, w = x.reshape(batch_size, -1), w.reshape(batch_size, -1)
+    num_segs = len(lengths)
+
+    if trunc is None:
+        with torch.no_grad():
+            x, w = torch.broadcast_tensors(x, w)
+
+            sorted_indices = utils3d.pt.segment_argsort(x, offsets, dim=-1)
+            
+            # Calculate right derivatives at each point
+            Q = utils3d.pt.segment_cumsum(torch.take_along_dim(w, sorted_indices, dim=-1).double(), offsets, dim=-1).float()    # NOTE: Use double to avoid numerical issues
+            right_derivatives = 2 * Q - Q.index_select(-1, offsets[1:] - 1).repeat_interleave(lengths, dim=-1)      # (..., N)
+
+            # Find zero points where right_derivative changes from negative to non-negative
+            zero_points_where_batch, zero_points_where_pos = torch.where((right_derivatives[..., :-1] <= 0) & (right_derivatives[..., 1:] > 0))  # ndim * (num_zero_points,)
+            zero_points_where_pos += 1  # shift to the right point because we are looking for left <= 0 and right > 0
+            zero_points_indices = sorted_indices[(zero_points_where_batch, zero_points_where_pos)]
+            zero_points_where_in_result = (zero_points_where_batch, seg_ids[zero_points_indices])
+
+            # Put COO zero points into (..., M) dense tensor
+            median_indices = torch.full((*x.shape[:-1], len(lengths)), torch.iinfo(torch.long).max, dtype=torch.long, device=x.device)
+            utils3d.pt.index_reduce_(median_indices, zero_points_where_in_result, zero_points_indices, reduce='min')
+
+            # If no zero point found, take the first element as median.
+            median_indices = torch.where(
+                median_indices == torch.iinfo(torch.long).max,
+                sorted_indices.index_select(-1, offsets[:-1]),   
+                median_indices
+            )
+    else:
+        raise NotImplementedError("Segmented truncated weighted median is not implemented yet.")
+    
+    median_values = torch.take_along_dim(x, median_indices, dim=-1)
+    median_values, median_indices = median_values.reshape(*batch_shape, -1), median_indices.reshape(*batch_shape, -1)
+    
+    return median_values, median_indices
+
+def segment_align_shift(x: Tensor, y: Tensor, w: Tensor, offsets: Tensor, trunc: Optional[Union[float, Tensor]] = None):
+    """
+    Solve `min sum_i w_i * |x_i + t - y_i|` if trunc is None, or `min sum_i min(trunc, w_i * |x_i + t - y_i|)` if trunc is given.
+
+    Parameters
+    -----
+    - `x: Tensor` of shape (..., N)
+    - `y: Tensor` of shape (..., N)
+    - `w: Tensor` of shape (..., N)
+    - `offsets: Tensor` of shape (..., M+1)
+
+    """
+    if trunc is None:
+        shift, index = segment_robust_weighted_median(y - x, w, offsets, trunc)
+    return shift, index
+

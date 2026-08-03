@@ -15,7 +15,7 @@ import utils3d
 from huggingface_hub import hf_hub_download
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, angle_diff_vec3
-from .utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+from .utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing, wrap_module_with_autocast
 from .modules.dinov2_encoder import DINOv2Encoder
 from .modules.mlp import MLP
 from .modules.conv_stack import ConvStack
@@ -132,6 +132,24 @@ class MoGeModel(nn.Module):
         for head in ['points_head', 'normal_head', 'mask_head']:
             if hasattr(self, head):
                 getattr(self, head).enable_gradient_checkpointing()
+
+    def enable_mixed_precision(self, dtype: torch.dtype = torch.bfloat16):
+        """Enable fine-grained mixed precision: run the encoder in `dtype`, keep the neck and heads in fp32.
+
+        Calling this repeatedly replaces the previous wrapping rather than stacking it.
+        """
+        for handle in getattr(self, '_autocast_handles', []):
+            handle.remove()
+
+        module_dtype_map = [
+            (self.encoder, dtype),
+            (self.neck, torch.float32),
+            *((getattr(self, head, None), torch.float32) for head in ['points_head', 'normal_head', 'mask_head', 'scale_head']),
+        ]
+        self._autocast_handles = [
+            wrap_module_with_autocast(module, device_type='cuda', dtype=module_dtype)
+            for module, module_dtype in module_dtype_map if module is not None
+        ]
 
     def _remap_points(self, points: torch.Tensor) -> torch.Tensor:
         if self.remap_output == 'linear':

@@ -279,7 +279,12 @@ def main(
                 if all(label == 'invalid' for label in label_type):
                     continue            # NOTE: Skip all-invalid batches to avoid messing up the optimizer.
                 
-                gt_points = utils3d.pt.depth_map_to_point_map(gt_depth, intrinsics=gt_intrinsics)
+                gt_points_raw = utils3d.pt.depth_map_to_point_map(gt_depth, intrinsics=gt_intrinsics)
+                # NOTE: Most loss functions now take the validity mask explicitly and assume the
+                # invalid entries have already been replaced, so compute both forms once here.
+                # `normal_loss` is the exception: it still derives its own mask from the raw map.
+                gt_points_mask = torch.isfinite(gt_points_raw).all(dim=-1)
+                gt_points = torch.where(gt_points_mask[..., None], gt_points_raw, 1)
                 gt_focal = 1 / (1 / gt_intrinsics[..., 0, 0] ** 2 + 1 / gt_intrinsics[..., 1, 1] ** 2) ** 0.5
 
                 with accelerator.accumulate(model):
@@ -301,19 +306,19 @@ def main(
                         for k, v in config['loss'][label_type[i]].items():
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
-                                loss_dict[k], misc_dict[k], gt_metric_scale = affine_invariant_global_loss(pred_points[i], gt_points[i], **v['params'])
+                                loss_dict[k], misc_dict[k], gt_metric_scale, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_points_mask[i], **v['params'])
                             elif v['function'] == 'affine_invariant_local_loss':
-                                loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_focal[i], gt_metric_scale, **v['params'])
+                                loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_points_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':
-                                loss_dict[k], misc_dict[k] = normal_loss(pred_points[i], gt_points[i])
+                                loss_dict[k], misc_dict[k] = normal_loss(pred_points[i], gt_points_raw[i])
                             elif v['function'] == 'edge_loss':
-                                loss_dict[k], misc_dict[k] = edge_loss(pred_points[i], gt_points[i])
+                                loss_dict[k], misc_dict[k] = edge_loss(pred_points[i], gt_points[i], gt_points_mask[i])
                             elif v['function'] == 'normal_map_loss':
                                 loss_dict[k], misc_dict[k] = normal_map_loss(pred_normal[i], gt_normal[i])
                             elif v['function'] == 'mask_bce_loss':
                                 loss_dict[k], misc_dict[k] = mask_bce_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
                             elif v['function'] == 'mask_l2_loss':
-                                loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
+                                loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_inf[i])
                             elif v['function'] == 'metric_scale_loss':
                                 if is_metric[i] and pred_metric_scale is not None:
                                     loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], gt_metric_scale)
@@ -331,7 +336,9 @@ def main(
                         misc_dict = {'.'.join(k): v for k, v in flatten_nested_dict(misc_dict).items()}
                         records.append({
                             **{k: v.item() for k, v in loss_dict.items()},
-                            **misc_dict,
+                            # NOTE: The loss functions return misc values as 0-dim tensors. Materialise
+                            # them here so records stay plain floats for key_average / gather_for_metrics.
+                            **{k: v.item() if isinstance(v, torch.Tensor) else v for k, v in misc_dict.items()},
                         })
 
                     loss = sum(loss_list) / len(loss_list)
