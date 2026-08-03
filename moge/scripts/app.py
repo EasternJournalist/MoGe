@@ -228,7 +228,7 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
             return [image, measure_points, depth_text]
         
     print("Create Gradio app...")
-    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    with gr.Blocks() as demo:
         gr.Markdown(
 f'''
 <div align="center">
@@ -294,7 +294,7 @@ f'''
             outputs=[measure_image, measure_points, measure_text]
         )
     
-    demo.launch(share=share)
+    demo.launch(share=share, theme=gr.themes.Soft())
 
 
 if __name__ == '__main__':
