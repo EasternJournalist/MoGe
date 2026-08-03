@@ -343,8 +343,10 @@ def normal_map_loss(pred_normal: torch.Tensor, gt_normal: torch.Tensor) -> torch
     return loss, {}
 
 
-def mask_l2_loss(mask_pred: torch.Tensor, mask_invalid: torch.Tensor) -> torch.Tensor:
-    loss = (mask_pred - (1 - mask_invalid.float())).square()
+def mask_l2_loss(pred_mask: torch.Tensor, gt_mask_pos: torch.Tensor, gt_mask_neg: torch.Tensor) -> torch.Tensor:
+    # NOTE: Only the labelled pixels contribute. Pixels that are in neither mask (e.g. regions
+    # with no depth annotation) are ignored rather than being supervised towards "valid".
+    loss = gt_mask_neg.float() * pred_mask.square() + gt_mask_pos.float() * (1 - pred_mask).square()
     loss = loss.mean(dim=(-2, -1))
     return loss, {}
 

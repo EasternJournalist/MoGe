@@ -318,7 +318,7 @@ def main(
                             elif v['function'] == 'mask_bce_loss':
                                 loss_dict[k], misc_dict[k] = mask_bce_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
                             elif v['function'] == 'mask_l2_loss':
-                                loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_inf[i])
+                                loss_dict[k], misc_dict[k] = mask_l2_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
                             elif v['function'] == 'metric_scale_loss':
                                 if is_metric[i] and pred_metric_scale is not None:
                                     loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], gt_metric_scale)
