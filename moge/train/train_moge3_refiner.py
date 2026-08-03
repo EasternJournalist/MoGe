@@ -636,9 +636,6 @@ def main(
                                             if is_metric[i] and pred_metric_scale is not None and step0_gt_metric_scale is not None:
                                                 loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], step0_gt_metric_scale)
 
-                                    if save_abnormal_instance and abnormal_triggered_steps and abnormal_saved_instances < max_abnormal_instances:
-                                
-
                                     weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
                                     loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
                                     loss_ = sum([weight_dict[k] * loss_dict[k] for k in loss_dict], start=torch.tensor(0.0, device=device))
@@ -816,7 +813,7 @@ def main(
                                     n_dec = n_total - n_inc
                                     pct = 100.0 * n_dec / n_total if n_total > 0 else 0.0
                                     cells.append(f'{pct:6.1f}%' if n_total > 0 else '   N/A')
-                                    refine_regression_log[f'refine_decrease/{name}_{s_from}_to_{s_to}'] = pct
+                                    refine_regression_log[f'loss_decrease/{name}_{s_from}_to_{s_to}'] = pct
                                 else:
                                     cells.append('      -')
                             pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
