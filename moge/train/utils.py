@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from ..utils.tools import flatten_nested_dict
-from .optim.muon import Muon
 
 
 def any_match(s: str, patterns: List[str]) -> bool:
@@ -229,14 +228,6 @@ def _get_param_group_optimizer_type(optimizer_config: Dict[str, Any], param_grou
     return optimizer_type
 
 
-def _is_muon_optimizer_type(optimizer_type: str) -> bool:
-    return optimizer_type.lower() in {'muon', 'selectivemuon'}
-
-
-def _is_adamw_optimizer_type(optimizer_type: str) -> bool:
-    return optimizer_type.lower() in {'adamw', 'adamw_backup'}
-
-
 def _get_torch_optimizer_cls(optimizer_type: str) -> Type[torch.optim.Optimizer]:
     if hasattr(torch.optim, optimizer_type):
         return getattr(torch.optim, optimizer_type)
@@ -299,54 +290,12 @@ def _optimizer_group_metadata(param_group_config: Dict[str, Any], optimizer_type
     return metadata
 
 
-def _is_muon_eligible_parameter(name: str, parameter: torch.nn.Parameter) -> bool:
-    return parameter.ndim >= 2 and 'embed_tokens' not in name and 'lm_head' not in name
-
-
 def build_optimizer(model: nn.Module, optimizer_config: Dict[str, Any]) -> torch.optim.Optimizer:
     named_parameters, named_param_groups = _build_named_param_groups(model, optimizer_config)
     param_group_optimizer_types = [
         _get_param_group_optimizer_type(optimizer_config, param_group_config)
         for param_group_config in optimizer_config['params']
     ]
-
-    if any(_is_muon_optimizer_type(optimizer_type) for optimizer_type in param_group_optimizer_types):
-        unsupported_types = sorted({
-            optimizer_type
-            for optimizer_type in param_group_optimizer_types
-            if not _is_muon_optimizer_type(optimizer_type) and not _is_adamw_optimizer_type(optimizer_type)
-        })
-        if unsupported_types:
-            raise ValueError(
-                'Muon param groups can only be mixed with AdamW/AdamW backup groups, '
-                f'got unsupported optimizer types: {unsupported_types}'
-            )
-
-        muon_params = [
-            parameter
-            for optimizer_type, named_params in zip(param_group_optimizer_types, named_param_groups)
-            if _is_muon_optimizer_type(optimizer_type)
-            for name, parameter in named_params.items()
-            if _is_muon_eligible_parameter(name, parameter)
-        ]
-        optimizer_defaults = _normalize_muon_options(_optimizer_option_items(optimizer_config))
-        param_groups = [
-            {
-                **_normalize_muon_options(_optimizer_option_items(param_group_config)),
-                **_optimizer_group_metadata(param_group_config, optimizer_type),
-                'params': list(params.values()),
-            }
-            for param_group_config, params, optimizer_type in zip(
-                optimizer_config['params'],
-                named_param_groups,
-                param_group_optimizer_types,
-            )
-        ]
-        return SelectiveMuon(
-            param_groups,
-            muon_params=muon_params,
-            **optimizer_defaults,
-        )
 
     unique_optimizer_types = {optimizer_type.lower() for optimizer_type in param_group_optimizer_types}
     if len(unique_optimizer_types) != 1:
@@ -369,56 +318,6 @@ def build_optimizer(model: nn.Module, optimizer_config: Dict[str, Any]) -> torch
     return optimizer_cls(param_groups, **optimizer_defaults)
 
 
-class SelectiveMuon(Muon):
-    def __init__(
-        self,
-        param_groups: List[Dict[str, Any]],
-        muon_params: Collection[torch.nn.Parameter],
-        lr: float = 1e-3,
-        wd: float = 0.1,
-        momentum: float = 0.95,
-        nesterov: bool = True,
-        ns_steps: int = 5,
-        ns_eps: float = 1e-7,
-        adamw_betas: Tuple[float, float] = (0.9, 0.95),
-        adamw_eps: float = 1e-8,
-    ):
-        defaults = dict(
-            lr=lr,
-            wd=wd,
-            momentum=momentum,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
-            ns_eps=ns_eps,
-            adamw_betas=adamw_betas,
-            adamw_eps=adamw_eps,
-        )
-        self._muon_param_ids = {id(p) for p in muon_params}
-        torch.optim.Optimizer.__init__(self, param_groups, defaults)
-        self.refresh_muon_flags()
-
-    def refresh_muon_flags(self):
-        for group in self.param_groups:
-            for p in group['params']:
-                self.state[p]['use_muon'] = id(p) in self._muon_param_ids
-
-    def load_state_dict(self, state_dict: Dict[str, Any]):
-        super().load_state_dict(state_dict)
-        self.refresh_muon_flags()
-
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state[p]
-                if state['use_muon']:
-                    continue
-                if 'moment1' not in state and 'exp_avg' in state:
-                    state['moment1'] = state['exp_avg']
-                if 'moment2' not in state and 'exp_avg_sq' in state:
-                    state['moment2'] = state['exp_avg_sq']
-                if 'step' in state and isinstance(state['step'], torch.Tensor):
-                    state['step'] = int(state['step'].item())
-
-
 def _is_dino_backbone_parameter(name: str) -> bool:
     return name == 'backbone' or name.startswith('backbone.') or '.backbone.' in name
 
@@ -432,43 +331,7 @@ def _is_refiner_parameter(name: str) -> bool:
     return name == 'refiner' or name.startswith('refiner.') or '.refiner.' in name
 
 
-def _use_muon_parameter(
-    name: str,
-    parameter: torch.nn.Parameter,
-    use_muon_for_backbone: bool,
-    use_muon_for_head: bool,
-    use_muon_for_refiner: bool = False,
-) -> bool:
-    if not _is_muon_eligible_parameter(name, parameter):
-        return False
-    return (
-        (use_muon_for_backbone and _is_dino_backbone_parameter(name))
-        or (use_muon_for_head and _is_head_parameter(name))
-        or (use_muon_for_refiner and _is_refiner_parameter(name))
-    )
-
-
-def _normalize_muon_options(options: Dict[str, Any]) -> Dict[str, Any]:
-    options = dict(options)
-    if 'weight_decay' in options and 'wd' not in options:
-        options['wd'] = options.pop('weight_decay')
-    if 'betas' in options and 'adamw_betas' not in options:
-        options['adamw_betas'] = options.pop('betas')
-    if 'eps' in options and 'adamw_eps' not in options:
-        options['adamw_eps'] = options.pop('eps')
-    return options
-
-
-def is_muon_optimizer_state(optimizer_state: Dict[str, Any]) -> bool:
-    return any(
-        isinstance(state, dict) and 'use_muon' in state
-        for state in optimizer_state.get('state', {}).values()
-    )
-
-
 def _optimizer_assignment_name(optimizer: torch.optim.Optimizer, parameter: torch.nn.Parameter) -> str:
-    if isinstance(optimizer, SelectiveMuon):
-        return 'muon' if optimizer.state[parameter]['use_muon'] else 'adamw_backup'
     return optimizer.__class__.__name__.lower()
 
 

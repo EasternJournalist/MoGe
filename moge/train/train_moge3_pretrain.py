@@ -29,7 +29,6 @@ from ..utils.tools import timeit
 from moge.train.dataloader import TrainDataLoaderPipeline
 from moge.train.losses import *
 from .utils import (
-    SelectiveMuon,
     build_optimizer,
     build_lr_scheduler,
     to_device,
@@ -43,7 +42,6 @@ from .utils import (
     materialize_log_records,
     to_log_scalar,
     write_bytes_retry_loop,
-    is_muon_optimizer_state,
     write_optimizer_param_assignment_log,
 )
 from ..utils.vis import colorize_depth, colorize_normal
@@ -215,11 +213,6 @@ def main(
     count_grouped_parameters = [sum(p.numel() for p in param_group['params'] if p.requires_grad) for param_group in optimizer.param_groups]
     for i, count in enumerate(count_grouped_parameters):
         print(f'- Group {i}: {count} parameters')
-    if isinstance(optimizer, SelectiveMuon):
-        count_muon_parameters = sum(p.numel() for param_group in optimizer.param_groups for p in param_group['params'] if p.requires_grad and optimizer.state[p]['use_muon'])
-        count_adamw_parameters = sum(p.numel() for param_group in optimizer.param_groups for p in param_group['params'] if p.requires_grad and not optimizer.state[p]['use_muon'])
-        print(f'- Muon: {count_muon_parameters} parameters')
-        print(f'- AdamW backup: {count_adamw_parameters} parameters')
     if accelerator.is_main_process:
         write_optimizer_param_assignment_log(
             model,
@@ -290,13 +283,7 @@ def main(
             initial_step = 0
             print('No step info found in checkpoint, start from step 0')
         if 'optimizer' in checkpoint:
-            checkpoint_optimizer_is_muon = is_muon_optimizer_state(checkpoint['optimizer'])
-            if isinstance(optimizer, SelectiveMuon) and not checkpoint_optimizer_is_muon:
-                print("Warning: Optimizer state in checkpoint is not Muon, optimizer is re-initialized")
-            elif not isinstance(optimizer, SelectiveMuon) and checkpoint_optimizer_is_muon:
-                print("Warning: Optimizer state in checkpoint is Muon, optimizer is re-initialized")
-            else:
-                optimizer.load_state_dict(checkpoint['optimizer'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
         else:
             print("Warning: No optimizer state found in checkpoint, optimizer is re-initialized")
         if enable_ema and accelerator.is_main_process:
