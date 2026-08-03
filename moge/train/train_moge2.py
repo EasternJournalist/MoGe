@@ -1,8 +1,6 @@
 import os
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 from pathlib import Path
-import sys
-if (_package_root := str(Path(__file__).absolute().parents[2])) not in sys.path:
-    sys.path.insert(0, _package_root)
 import json
 import time
 import random
@@ -25,26 +23,29 @@ from accelerate.utils import set_seed
 import utils3d
 import click
 from tqdm import tqdm, trange
-import mlflow
+try:
+    import mlflow
+except ImportError:
+    mlflow = None       # NOTE: Optional dependency. `--enable_mlflow` is a no-op when unavailable.
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
 
 from moge.train.dataloader import TrainDataLoaderPipeline
 from moge.train.losses import (
     affine_invariant_global_loss,
-    affine_invariant_local_loss, 
+    affine_invariant_local_loss,
     edge_loss,
-    normal_loss, 
-    mask_l2_loss, 
+    normal_loss,
+    mask_l2_loss,
     mask_bce_loss,
     metric_scale_loss,
     normal_map_loss,
-    monitoring, 
+    monitoring,
 )
-from moge.train.utils import build_optimizer, build_lr_scheduler
-from moge.utils.geometry_torch import intrinsics_to_fov
-from moge.utils.vis import colorize_depth, colorize_normal
-from moge.utils.tools import key_average, recursive_replace, CallbackOnException, flatten_nested_dict
-from moge.test.metrics import compute_metrics
+from .utils import build_optimizer, build_lr_scheduler
+from ..utils.geometry_torch import intrinsics_to_fov
+from ..utils.vis import colorize_depth, colorize_normal
+from ..utils.tools import key_average, recursive_replace, CallbackOnException, flatten_nested_dict
+from ..test.metrics import compute_metrics
 
 
 @click.command()
@@ -96,7 +97,7 @@ def main(
 
     # Log config
     if accelerator.is_main_process:
-        if enable_mlflow:
+        if enable_mlflow and mlflow is not None:
             try:
                 mlflow.log_params({
                     **click.get_current_context().params,
@@ -362,7 +363,7 @@ def main(
                 records = accelerator.gather_for_metrics(records, use_gather_object=True)
                 if accelerator.is_main_process:
                     records = key_average(records)
-                    if enable_mlflow:
+                    if enable_mlflow and mlflow is not None:
                         try:
                             mlflow.log_metrics(records, step=i_step)
                         except Exception as e:
