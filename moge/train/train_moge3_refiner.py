@@ -32,6 +32,7 @@ from moge.train.losses import *
 from .utils import (
     accumulate_step_transitions,
     build_optimizer,
+    refine_step_pairs,
     build_lr_scheduler,
     to_device,
     materialize_log_records,
@@ -92,6 +93,7 @@ def main(
     with open(config_path, 'r') as f:
         config = json.load(f)
     refine_ratio = config['refine_ratio']
+    monitor_pairs = refine_step_pairs(config['refine_steps'])
     if not 0.0 <= refine_ratio <= 1.0:
         raise ValueError(f"config['refine_ratio'] must be in [0, 1], got {refine_ratio}")
 
@@ -456,9 +458,9 @@ def main(
                                                 misc_error_by_step.setdefault(base_name, {})[step_num] = mv
 
                                         # Counted predicate must match how each table reports it.
-                                        accumulate_step_transitions(monitor_loss_by_step, loss_decrease_tracker, lambda to, fr: to > fr)
-                                        accumulate_step_transitions(misc_delta_by_step, delta_increase_tracker, lambda to, fr: to > fr)
-                                        accumulate_step_transitions(misc_error_by_step, error_decrease_tracker, lambda to, fr: to < fr)
+                                        accumulate_step_transitions(monitor_loss_by_step, loss_decrease_tracker, lambda to, fr: to > fr, monitor_pairs)
+                                        accumulate_step_transitions(misc_delta_by_step, delta_increase_tracker, lambda to, fr: to > fr, monitor_pairs)
+                                        accumulate_step_transitions(misc_error_by_step, error_decrease_tracker, lambda to, fr: to < fr, monitor_pairs)
 
                                 loss = sum(loss_list) / len(loss_list)  # Average over the batch
                             records.append({'train/loss': to_log_scalar(loss)})
@@ -509,17 +511,17 @@ def main(
                     write_refine_monitor_table(
                         pbar, i_step, loss_decrease_tracker, loss_decrease_log,
                         title='Refine loss decrease% monitor (bigger=better):',
-                        label='loss', log_prefix='loss_decrease', invert=True,
+                        label='loss', log_prefix='loss_decrease', pairs=monitor_pairs, invert=True,
                     )
                     write_refine_monitor_table(
                         pbar, i_step, delta_increase_tracker, delta_increase_log,
                         title='Misc delta increase% monitor (bigger=better):',
-                        label='metric', log_prefix='delta_increase',
+                        label='metric', log_prefix='delta_increase', pairs=monitor_pairs,
                     )
                     write_refine_monitor_table(
                         pbar, i_step, error_decrease_tracker, error_decrease_log,
                         title='Misc error decrease% monitor (bigger=better):',
-                        label='metric', log_prefix='error_decrease',
+                        label='metric', log_prefix='error_decrease', pairs=monitor_pairs,
                     )
 
             # Log metrics

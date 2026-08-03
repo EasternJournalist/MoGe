@@ -429,8 +429,17 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, scheduler_config: Dict[
     return scheduler
 
 
-# Refine-step pairs reported by the monitor tables below.
-_REFINE_STEP_PAIRS = [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]
+def refine_step_pairs(refine_steps: int) -> List[Tuple[int, int]]:
+    """The refine-step transitions the monitor tables report, for a run of `refine_steps` steps.
+
+    Every consecutive transition, then the two spans 0->n (what refinement
+    achieved overall), and 1->n (the refiner's incremental contribution). 
+    """
+    pairs = [(i, i + 1) for i in range(refine_steps)]
+    for span in ((0, refine_steps), (1, refine_steps)):
+        if span[0] < span[1] and span not in pairs:
+            pairs.append(span)
+    return pairs
 
 
 def split_step_suffix(key: str) -> Tuple[str, int]:
@@ -446,6 +455,7 @@ def accumulate_step_transitions(
     values_by_step: Dict[str, Dict[int, float]],
     tracker: Dict[Tuple, List[int]],
     count_when: Callable[[float, float], bool],
+    pairs: Sequence[Tuple[int, int]],
 ) -> None:
     """Tally, per (name, step_from, step_to), how many instances satisfy `count_when`.
 
@@ -455,7 +465,7 @@ def accumulate_step_transitions(
     table inverts, while the delta and error trackers count the outcome they name.
     """
     for name, step_vals in values_by_step.items():
-        for step_from, step_to in _REFINE_STEP_PAIRS:
+        for step_from, step_to in pairs:
             if step_from in step_vals and step_to in step_vals:
                 entry = tracker.setdefault((name, step_from, step_to), [0, 0])
                 entry[1] += 1
@@ -471,6 +481,7 @@ def write_refine_monitor_table(
     title: str,
     label: str,
     log_prefix: str,
+    pairs: Sequence[Tuple[int, int]],
     invert: bool = False,
 ) -> None:
     """Print one "% of instances that improved" table over refine-step transitions.
@@ -488,11 +499,11 @@ def write_refine_monitor_table(
     pbar.write(f'[Step {i_step}] {title}')
     names = sorted({name for name, _, _ in tracker})
     name_width = max(len(label), *(len(name) for name in names))
-    header = '  '.join(f'{f"{a}->{b}":>7s}' for a, b in _REFINE_STEP_PAIRS)
+    header = '  '.join(f'{f"{a}->{b}":>7s}' for a, b in pairs)
     pbar.write(f'  {label:<{name_width}s}  {header}')
     for name in names:
         cells = []
-        for step_from, step_to in _REFINE_STEP_PAIRS:
+        for step_from, step_to in pairs:
             entry = tracker.get((name, step_from, step_to))
             if entry is None:
                 cells.append('      -')
