@@ -88,10 +88,6 @@ def materialize_log_records(log_records: List[Dict[str, Any]]) -> List[Dict[str,
     return materialized
 
 
-def materialize_scalar_dict(values: Dict[str, Any]) -> Dict[str, float]:
-    return materialize_log_records([values])[0]
-
-
 def group_loss_values(loss_value: torch.Tensor, group_size: int) -> torch.Tensor:
     if loss_value.numel() == 1:
         return loss_value.reshape(()).expand(group_size)
@@ -331,7 +327,7 @@ def _is_refiner_parameter(name: str) -> bool:
     return name == 'refiner' or name.startswith('refiner.') or '.refiner.' in name
 
 
-def _optimizer_assignment_name(optimizer: torch.optim.Optimizer, parameter: torch.nn.Parameter) -> str:
+def _optimizer_assignment_name(optimizer: torch.optim.Optimizer) -> str:
     return optimizer.__class__.__name__.lower()
 
 
@@ -357,7 +353,7 @@ def write_optimizer_param_assignment_log(
             group_options = {}
         else:
             group_idx, group_options = group_info
-            assignment = _optimizer_assignment_name(optimizer, parameter)
+            assignment = _optimizer_assignment_name(optimizer)
 
         numel = parameter.numel()
         summary[assignment] += 1

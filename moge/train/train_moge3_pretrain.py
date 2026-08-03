@@ -34,19 +34,17 @@ from .utils import (
     to_device,
     append_group_log_dict,
     append_group_log_value,
-    cleanup_old_rolling_ckpts,
-    record_rolling_ckpt,
-    detach_to_cpu,
-    filter_outliers,
     group_loss_values,
     materialize_log_records,
     to_log_scalar,
-    write_bytes_retry_loop,
     write_optimizer_param_assignment_log,
 )
-from ..utils.vis import colorize_depth, colorize_normal
-from ..utils.tools import key_average, recursive_replace, CallbackOnException
-from ..test.metrics import compute_metrics
+from ..utils.tools import key_average
+from .options import common_train_options
+from .experiment import RunLogger, setup_accelerator
+from .checkpoint import CheckpointSaver, load_checkpoint, restore_ma_buffer, restore_training_state
+from .debug import DebugDumper
+from .visualization import visualize_gt, visualize_predictions
 
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
@@ -55,33 +53,7 @@ torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudn
 
 
 @click.command()
-@click.option('--config', 'config_path', type=str, default='configs/debug.json')
-@click.option('--name', 'experiment_name', type=str, default='debug', help='Name of the experiment')
-@click.option('--workspace_path', type=str, default='./workspace/', help='Path of workspace for saving visualizations and checkpoints')
-@click.option('--base_checkpoint', type=str, default="")
-@click.option('--checkpoint', 'checkpoint_path', type=str, default='latest', help='Path to the checkpoint to load, step number, "latest", or "none"')
-@click.option('--batch_size_forward', type=int, default=1, help='Batch size for each forward pass on each device')
-@click.option('--gradient_accumulation_steps', type=int, default=2, help='Number of steps to accumulate gradients')
-@click.option('--backbone_gradient_checkpoint', type=bool, default=False, help='Use gradient checkpointing in backbone')
-@click.option('--precision', type=click.Choice(['fp32', 'tf32', 'mixed_bf16']), default='fp32', help='Numerical precision to use')
-@click.option('--enable_ema', type=bool, default=True, help='Maintain an exponential moving average of the model weights')
-@click.option('--debug', 'debug_mode', type=bool, default=False, help='Enable debug mode')
-@click.option('--num_iterations', type=int, default=1000000, help='Number of iterations to train the model')
-@click.option('--checkpoint_every', type=int, default=5000, help='Save permanent checkpoint every n iterations')
-@click.option('--rolling_checkpoint_every', type=int, default=500, help='Save rolling checkpoint every n iterations (only keeps the latest)')
-@click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
-@click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
-@click.option('--vis_gt', type=bool, default=True, help='Visualize ground truth')
-@click.option('--num_vis_images', type=int, default=32, help='Number of images to visualize, must be a multiple of divided batch size')
-@click.option('--log_type', type=click.Choice(['mlflow', 'tensorboard', 'wandb']), multiple=True, default=('tensorboard',), help='log type to use (can specify multiple)')
-@click.option('--log_dir', type=str, default=None, help='Root directory for tensorboard logs')
-@click.option('--gc_every', type=int, default=1000, help='Run garbage collection every n iterations to reduce memory usage')
-@click.option('--seed', type=int, default=0, help='Random seed')
-@click.option('--wandb_project', type=str, default='MoGe', help='Weights & Biases project name')
-@click.option('--max_invalid_batches', type=int, default=-1, help='Maximum number of all-invalid batches before abort; set to -1 to disable this check')
-@click.option('--find_unused_parameters', type=bool, default=True, help='Whether to set find_unused_parameters=True for DistributedDataParallel, which may be necessary if not all model parameters receive gradients in each iteration')
-@click.option('--num_load_workers', type=int, default=4, help='Number of workers for loading data')
-@click.option('--num_process_workers', type=int, default=8, help='Number of workers for processing data')
+@common_train_options
 def main(
     config_path: str,
     experiment_name: str,
@@ -115,65 +87,14 @@ def main(
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    accelerator = Accelerator(
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters),
-            InitProcessGroupKwargs(timeout=timedelta(hours=1))
-        ]
+    accelerator, device, batch_size_total, workspace = setup_accelerator(
+        gradient_accumulation_steps, find_unused_parameters, batch_size_forward, workspace_path,
     )
-
-    device = accelerator.device
-    batch_size_total = batch_size_forward * gradient_accumulation_steps * accelerator.num_processes
-
-    workspace = Path(workspace_path)
-
-    tb_writer = None
-    wandb_run = None
-
-    # Log config
-    if accelerator.is_main_process:
-        try:
-            current_git_commit_id = git.Repo(search_parent_directories=True).head.object.hexsha
-        except Exception:
-            current_git_commit_id = 'N/A'
-        experiment_params = {
-            **click.get_current_context().params,
-            'batch_size_total': batch_size_total,
-            'git_commit_id': current_git_commit_id,
-        }
-        log_type_set = set(log_type)
-        if 'mlflow' in log_type_set:
-            try:
-                import mlflow
-                mlflow.log_params(experiment_params)
-            except Exception:
-                print('Failed to log config to MLFlow')
-                traceback.print_exc()
-        if 'tensorboard' in log_type_set:
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-                if log_dir is None:
-                    log_dir = './tensorboard/'
-                tb_writer = SummaryWriter(log_dir=Path(log_dir, experiment_name))
-                tb_writer.add_text('params', json.dumps(experiment_params, indent=4))
-                tb_writer.flush()
-            except Exception:
-                print('Failed to log config to TensorBoard')
-                traceback.print_exc()
-        if 'wandb' in log_type_set:
-            try:
-                import wandb
-                wandb_run = wandb.init(name=experiment_name, config=experiment_params, project=wandb_project)
-            except Exception:
-                print('Failed to log config to Weights & Biases')
-                traceback.print_exc()
-
-        Path(workspace).mkdir(parents=True, exist_ok=True)
-        with Path(workspace).joinpath('config.json').open('w') as f:
-            json.dump(config, f, indent=4)
-        with Path(workspace).joinpath('experiment_params.json').open('w') as f:
-            json.dump(experiment_params, f, indent=4)
+    logger = RunLogger(accelerator, log_type)
+    logger.setup(
+        workspace=workspace, config=config, experiment_name=experiment_name,
+        log_dir=log_dir, wandb_project=wandb_project, batch_size_total=batch_size_total,
+    )
 
     # Set seed
     if seed is not None:
@@ -220,84 +141,16 @@ def main(
             workspace,
         )
 
-    # Attempt to load checkpoint
-    def load_checkpoint(ckpt_path: Optional[str]) -> Dict[str, Any]:
-        with accelerator.local_main_process_first():
-            checkpoint = None
-            if not ckpt_path or ckpt_path == 'none':
-                # - No checkpoint requested
-                pass
-            elif ckpt_path.endswith('.pt'):
-                # - Load specific checkpoint file
-                print(f'Load checkpoint: {ckpt_path}')
-                checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-            elif ckpt_path == "latest": 
-                # - Load latest
-                ckpt_path = Path(workspace, 'checkpoint', 'latest.pt')
-                if ckpt_path.exists():
-                    print(f'Load checkpoint: {ckpt_path}')
-                    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-                    i_step = checkpoint['step']
-                    if 'model' not in checkpoint and (checkpoint_model_path := Path(workspace, 'checkpoint', f'{i_step:08d}.pt')).exists():
-                        print(f'Load model checkpoint: {checkpoint_model_path}')
-                        checkpoint['model'] = torch.load(checkpoint_model_path, map_location='cpu', weights_only=True)['model']
-                    if 'optimizer' not in checkpoint and (checkpoint_optimizer_path := Path(workspace, 'checkpoint', f'{i_step:08d}_optimizer.pt')).exists():
-                        print(f'Load optimizer checkpoint: {checkpoint_optimizer_path}')
-                        checkpoint.update(torch.load(checkpoint_optimizer_path, map_location='cpu', weights_only=True))
-                    if enable_ema and accelerator.is_main_process:
-                        if 'ema_model' not in checkpoint and (checkpoint_ema_model_path := Path(workspace, 'checkpoint', f'{i_step:08d}_ema.pt')).exists():
-                            print(f'Load EMA model checkpoint: {checkpoint_ema_model_path}')
-                            checkpoint['ema_model'] = torch.load(checkpoint_ema_model_path, map_location='cpu', weights_only=True)['model']
-            elif ckpt_path is not None and ckpt_path.isdigit():
-                # - Load by step number
-                i_step = int(ckpt_path)
-                checkpoint = {'step': i_step}
-                if (checkpoint_model_path := Path(workspace, 'checkpoint', f'{i_step:08d}.pt')).exists():
-                    print(f'Load model checkpoint: {checkpoint_model_path}')
-                    checkpoint['model'] = torch.load(checkpoint_model_path, map_location='cpu', weights_only=True)['model']
-                if (checkpoint_optimizer_path := Path(workspace, 'checkpoint', f'{i_step:08d}_optimizer.pt')).exists():
-                    print(f'Load optimizer checkpoint: {checkpoint_optimizer_path}')
-                    checkpoint.update(torch.load(checkpoint_optimizer_path, map_location='cpu', weights_only=True))
-                if enable_ema and accelerator.is_main_process:
-                    if (checkpoint_ema_model_path := Path(workspace, 'checkpoint', f'{i_step:08d}_ema.pt')).exists():
-                        print(f'Load EMA model checkpoint: {checkpoint_ema_model_path}')
-                        checkpoint['ema_model'] = torch.load(checkpoint_ema_model_path, map_location='cpu', weights_only=True)['model']
-        return checkpoint
-
-    checkpoint = load_checkpoint(checkpoint_path)
+    # Attempt to load checkpoint; fall back to the base checkpoint when the workspace has none.
+    checkpoint = load_checkpoint(checkpoint_path, workspace, accelerator, enable_ema)
     if checkpoint is None:
-        checkpoint = load_checkpoint(base_checkpoint)
+        checkpoint = load_checkpoint(base_checkpoint, workspace, accelerator, enable_ema)
+    initial_step = restore_training_state(
+        checkpoint, model, optimizer, lr_scheduler, ema_model if enable_ema and accelerator.is_main_process else None,
+        accelerator, enable_ema,
+    )
+    del checkpoint
 
-    if checkpoint is None:
-        # Initialize model weights
-        print('Initialize model weights')
-        with accelerator.local_main_process_first():
-            model.init_weights()
-        initial_step = 0
-    else:
-        model.load_state_dict(checkpoint['model'], strict=False)
-        if 'step' in checkpoint:
-            initial_step = checkpoint['step'] + 1
-            print(f"Resume from step {initial_step}")
-        else:
-            initial_step = 0
-            print('No step info found in checkpoint, start from step 0')
-        if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        else:
-            print("Warning: No optimizer state found in checkpoint, optimizer is re-initialized")
-        if enable_ema and accelerator.is_main_process:
-            if 'ema_model' in checkpoint:
-                ema_model.module.load_state_dict(checkpoint['ema_model'], strict=False)
-            else:
-                print("Warning: EMA enabled but no EMA model state found in checkpoint, EMA model is re-initialized")
-        if 'lr_scheduler' in checkpoint:
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        else:
-            print("Warning: No lr_scheduler state found in checkpoint, lr_scheduler is re-initialized")
-
-        del checkpoint
-    
     model, optimizer = accelerator.prepare(model, optimizer)
     if torch.version.hip and isinstance(model, torch.nn.parallel.DistributedDataParallel):
         # Hacking potential gradient synchronization issue in ROCm backend
@@ -328,44 +181,8 @@ def main(
         else:
             print(f"Warning: No data pipeline state found for rank {accelerator.process_index}, data ordering will restart from the beginning")
 
-    def _dump_debug_state(
-        step: int,
-        accumulate_step: int,
-        reasons: List[str],
-        batch: Any,
-        output: Any,
-    ) -> Path:
-        """Dump (batch, output, reasons) so the failing forward pass can be replayed offline.
-
-        ``reasons`` is a list of short tags (e.g. ``'nan_loss_<name>'``, ``'nan_grad_norm'``,
-        ``'large_grad_norm_12.34'``). The first tag is used in the filename for quick triage.
-        """
-        dump_path = Path(
-            workspace,
-            'debug',
-            f'step_{step:08d}_accum_{accumulate_step}_proc_{accelerator.process_index}_reasons_{reasons[0]}.pkl',
-        )
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        with dump_path.open('wb') as f:
-            torch.save({
-                'batch': detach_to_cpu(batch),
-                'output': detach_to_cpu(output),
-                'reasons': reasons,
-            }, f)
-        return dump_path
-
     records = []
-    ma_buffer = deque(maxlen=1000)
-
-    # Restore moving-average buffer (for ma1000/avg1000 metrics) if resuming, so log curves stay continuous
-    if initial_step > 0 and accelerator.is_main_process:
-        _ma_buffer_path = Path(workspace, 'checkpoint', 'latest_ma_buffer.pt')
-        if _ma_buffer_path.exists():
-            _ma_buffer_state = torch.load(_ma_buffer_path, map_location='cpu', weights_only=False)
-            ma_buffer = deque(_ma_buffer_state.get('ma_buffer', []), maxlen=1000)
-            print(f"Restored ma_buffer ({len(ma_buffer)} entries) from step {_ma_buffer_state.get('step', '?')}")
-        else:
-            print("Warning: No ma_buffer state found, ma1000/avg1000 metrics will restart from the beginning")
+    ma_buffer = restore_ma_buffer(workspace, initial_step, accelerator)
 
     model.train()
 
@@ -373,7 +190,16 @@ def main(
         train_data_pipeline,
         tqdm(initial=initial_step, total=num_iterations, desc='Training', disable=not accelerator.is_main_process) as pbar,
         ThreadPoolExecutor(max_workers=1) as save_checkpoint_executor,
-    ):  
+    ):
+        checkpoint_saver = CheckpointSaver(
+            workspace=workspace, config=config, accelerator=accelerator, model=model,
+            optimizer=optimizer, lr_scheduler=lr_scheduler,
+            ema_model=ema_model if enable_ema and accelerator.is_main_process else None,
+            enable_ema=enable_ema, ma_buffer=ma_buffer, executor=save_checkpoint_executor,
+            pbar=pbar, num_iterations=num_iterations, checkpoint_every=checkpoint_every,
+            rolling_checkpoint_every=rolling_checkpoint_every, initial_step=initial_step,
+        )
+
         # Get some batches for visualization
         if accelerator.is_main_process:
             batches_for_vis: List[Dict[str, torch.Tensor]] = []
@@ -384,50 +210,18 @@ def main(
 
         # Visualize GT
         if vis_every > 0 and accelerator.is_main_process and vis_gt:
-            save_dir = Path(workspace).joinpath('vis/gt')
-            for i_batch, batch in enumerate(tqdm(batches_for_vis, desc='Visualize GT', leave=False)):
-                image, gt_depth, gt_normal, gt_intrinsics, info = batch['image'], batch['depth'], batch['normal'], batch['intrinsics'], batch['info']
-                gt_points = utils3d.pt.depth_map_to_point_map(gt_depth, intrinsics=gt_intrinsics)
-                for i_instance in range(batch['image'].shape[0]):
-                    idx = i_batch * batch_size_forward + i_instance
-                    image_i = (image[i_instance].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                    gt_depth_i = gt_depth[i_instance].numpy()
-                    gt_points_i = gt_points[i_instance].numpy()
-                    gt_normal_i = gt_normal[i_instance].numpy()
-                    save_dir.joinpath(f'{idx:04d}').mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/image.jpg')), cv2.cvtColor(image_i, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/points.exr')), cv2.cvtColor(gt_points_i, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
-                    cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/depth_vis.png')), cv2.cvtColor(colorize_depth(gt_depth_i), cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/normal.png')), cv2.cvtColor(colorize_normal(gt_normal_i), cv2.COLOR_RGB2BGR))
-                    if 'mlflow' in log_type_set:
-                        try:
-                            mlflow.log_image(image_i, key=f'{idx:04d}-image-gt', step=initial_step)
-                            mlflow.log_image(colorize_depth(gt_depth_i), key=f'{idx:04d}-depth_vis-gt', step=initial_step)
-                            # mlflow.log_image(gt_mask_i * 255, key=f'{idx:04d}-mask-gt', step=initial_step)
-                            # mlflow.log_image(colorize_normal(gt_normal_i), key=f'{idx:04d}-normal-gt', step=initial_step)
-                            # mlflow.log_image(gt_mask_inf_i * 255, key=f'{idx:04d}-mask_inf-gt', step=initial_step)
-                        except Exception as e:
-                            print(f"Failed to log image to mlflow: {e}")
-                    with save_dir.joinpath(f'{idx:04d}/info.json').open('w') as f:
-                        json.dump(info[i_instance], f)
+            visualize_gt(batches_for_vis, workspace, batch_size_forward, initial_step, logger)
 
         # Reset seed to avoid training on the same data when resuming training
         if seed is not None:
             set_seed(seed + initial_step, device_specific=True)   
 
-        # --- Debug dump state ---
-        # ``dump_reasons`` collects short string tags describing why the current step should be
-        # dumped. The dump is performed once per accumulation when any tag is present. To add a
-        # new trigger, just append a tag at the appropriate site (see e.g. the grad-norm checks
-        # below). Tags starting with ``'nan_'`` are considered fatal and count toward the abort
-        # threshold; other tags (e.g. ``large_grad_norm_*``) are informational and capped by
-        # ``max_extra_dumps`` to avoid filling disk.
-        nan_encountered_times = 0
-        max_nan_dumps_before_abort = 10
-        extra_dump_count = 0
-        max_extra_dumps = 25
-        dump_grad_norm_above: Optional[float] = None
-        dump_reasons: List[str] = []
+        # Tags starting with 'nan_' are fatal and count toward the abort threshold; others
+        # (e.g. large_grad_norm_*) are informational and capped to avoid filling disk.
+        dumper = DebugDumper(
+            workspace, accelerator,
+            dump_grad_norm_above=config.get('dump_grad_norm_above'),
+        )
         invalid_batch_encountered_times = 0
 
         # Training loop
@@ -484,10 +278,10 @@ def main(
                                     label_to_indices.setdefault(label, []).append(i)
 
                                 def accumulate_group_loss(loss_name: str, loss_value: torch.Tensor, weight: float, group_size: int):
-                                    nonlocal loss_sum, dump_reasons
+                                    nonlocal loss_sum
                                     if not torch.isfinite(loss_value.detach()).all().cpu().item():
                                         pbar.write(f'NaN loss in process {accelerator.process_index}, loss name: {loss_name}')
-                                        dump_reasons.append(f'nan_loss_{loss_name}')
+                                        dumper.add_reason(f'nan_loss_{loss_name}')
                                     loss_sum = loss_sum + weight * group_loss_values(loss_value, group_size).sum()
 
                                 for label, indices_list in label_to_indices.items():
@@ -637,41 +431,16 @@ def main(
                             else:
                                 pbar.write(f'Non-finite gradient norm {grad_norm} encountered in process {accelerator.process_index}, skip optimizer step.')
                                 pbar.write(f'Batch info: {info}')
-                                dump_reasons.append('nan_grad_norm')
+                                dumper.add_reason('nan_grad_norm')
 
                             # Extra dump trigger: large (but finite) grad norm.
                             # Controlled by config['dump_grad_norm_above']; capped by max_extra_dumps.
-                            if (
-                                dump_grad_norm_above is not None
-                                and grad_norm_is_finite
-                                and extra_dump_count < max_extra_dumps
-                            ):
-                                grad_norm_value = float(grad_norm.detach().cpu().item())
-                                if grad_norm_value > dump_grad_norm_above:
-                                    dump_reasons.append(f'large_grad_norm_{grad_norm_value:.2f}')
+                            dumper.note_grad_norm(grad_norm, grad_norm_is_finite)
 
-                            optimizer.zero_grad()
+                        optimizer.zero_grad()
 
-                        # Handle dump triggers (NaN loss / NaN grad norm / large grad norm / ...)
-                        if dump_reasons:
-                            has_nan_reason = any(r.startswith('nan_') for r in dump_reasons)
-                            if has_nan_reason:
-                                nan_encountered_times += 1
-                            else:
-                                extra_dump_count += 1
-                            # Dump batch + model output so losses can be recomputed offline
-                            _dump_debug_state(
-                                step=i_step,
-                                accumulate_step=i_accumulate,
-                                reasons=dump_reasons,
-                                batch=batch,
-                                output=output,
-                            )
-                            # Reset trigger list for next accumulation step
-                            dump_reasons = []
-                            # Raise error if too many NaNs encountered
-                            if nan_encountered_times >= max_nan_dumps_before_abort:
-                                raise RuntimeError('NaN encountered too many times, abort training.')
+                        dumper.flush(i_step, i_accumulate, batch, output)
+
             records.append({'time/step': timer_step.time})
 
             lr_scheduler.step()
@@ -691,153 +460,12 @@ def main(
 
             # Log metrics
             if i_step != initial_step and i_step % log_every == 0:
-                records = [key_average(materialize_log_records(records))]
-                accelerator.wait_for_everyone()
-                records = accelerator.gather_for_metrics(records, use_gather_object=True)
-                if accelerator.is_main_process:
-                    records = key_average(records)
-                    # Moving average of last 1000 log points for loss and misc metrics
-                    # Exclude partition diagnostic metrics (num_groups, points_per_group) from moving averages
-                    _ma_exclude_suffixes = ('num_groups', 'points_per_group')
-                    loss_misc_snapshot = {
-                        k: v for k, v in records.items()
-                        if k.startswith(('loss/', 'misc/')) and not k.endswith(_ma_exclude_suffixes)
-                    }
-                    ma_buffer.append(loss_misc_snapshot)
-                    for k in loss_misc_snapshot:
-                        values = [d[k] for d in ma_buffer if k in d]
-                        values = filter_outliers(values)
-                        if values:
-                            prefix, rest = k.split('/', 1)
-                            records[f'ma1000_{prefix}/{rest}'] = sum(values) / len(values)
-                    last_lrs = lr_scheduler.get_last_lr()
-                    records['train/lr'] = last_lrs[0]
-                    if len(last_lrs) > 2:
-                        records['train/lr_refiner'] = last_lrs[1]
-                        records['train/lr_backbone'] = last_lrs[2]
-                    elif len(last_lrs) > 1:
-                        records['train/lr_backbone'] = last_lrs[1]
-                    # Compute and upload avg1000 every 1000 steps (reuse ma_buffer)
-                    if i_step % 1000 == 0 and i_step != initial_step and ma_buffer:
-                        avg1000_raw = key_average(list(ma_buffer))
-                        for k, v in avg1000_raw.items():
-                            values = [d[k] for d in ma_buffer if k in d]
-                            values = filter_outliers(values)
-                            if values:
-                                prefix, rest = k.split('/', 1)
-                                records[f'avg1000_{prefix}/{rest}'] = sum(values) / len(values)
-                    if 'mlflow' in log_type_set:
-                        try:
-                            mlflow.log_metrics(records, step=i_step)
-                        except Exception as e:
-                            print(f'Error while logging metrics to mlflow: {e}')
-                            traceback.print_exc()
-                    if 'tensorboard' in log_type_set and tb_writer is not None:
-                        try:
-                            for k, v in records.items():
-                                tb_writer.add_scalar(k, v, i_step)
-                            tb_writer.flush()
-                        except Exception:
-                            print('Error while logging metrics to TensorBoard')
-                            traceback.print_exc()
-                    if 'wandb' in log_type_set and wandb_run is not None:
-                        try:
-                            wandb.log(records, step=i_step)
-                        except Exception:
-                            print('Error while logging metrics to Weights & Biases')
-                            traceback.print_exc()
-                records = []
+                records = logger.log_metrics(records, ma_buffer, lr_scheduler, i_step, initial_step)
 
-            def save_ckpt(async_save=True):
-                # NOTE: Writing checkpoint is done in a separate thread to avoid blocking the main process
-                ckpt_name = 'final' if i_step == num_iterations - 1 else f'{i_step:08d}' 
-                pbar.write(f'Save checkpoint: {i_step:08d}')
-                Path(workspace, 'checkpoint').mkdir(parents=True, exist_ok=True)
-
-                # Model checkpoint
-                with io.BytesIO() as f:
-                    torch.save({
-                        'model_config': config['model'],
-                        'model': accelerator.unwrap_model(model).state_dict(),
-                    }, f)
-                    checkpoint_bytes = f.getvalue()
-                if async_save:
-                    save_checkpoint_executor.submit(
-                        write_bytes_retry_loop, Path(workspace, 'checkpoint', f'{ckpt_name}.pt'), checkpoint_bytes
-                    )
-                else:
-                    write_bytes_retry_loop(Path(workspace, 'checkpoint', f'{ckpt_name}.pt'), checkpoint_bytes)
-
-                # Optimizer checkpoint
-                with io.BytesIO() as f:
-                    torch.save({
-                        'model_config': config['model'],
-                        'step': i_step,
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                    }, f)
-                    checkpoint_bytes = f.getvalue()
-                if async_save:
-                    save_checkpoint_executor.submit(
-                        write_bytes_retry_loop, Path(workspace, 'checkpoint', f'{ckpt_name}_optimizer.pt'), checkpoint_bytes
-                    )
-                else:
-                    write_bytes_retry_loop(Path(workspace, 'checkpoint', f'{ckpt_name}_optimizer.pt'), checkpoint_bytes)
-
-                # EMA model checkpoint
-                if enable_ema:
-                    with io.BytesIO() as f:
-                        torch.save({
-                            'model_config': config['model'],
-                            'model': ema_model.module.state_dict(),
-                        }, f)
-                        checkpoint_bytes = f.getvalue()
-                    save_checkpoint_executor.submit(
-                        write_bytes_retry_loop, Path(workspace, 'checkpoint', f'{ckpt_name}_ema.pt'), checkpoint_bytes
-                    )
-
-                # Latest checkpoint
-                with io.BytesIO() as f:
-                    torch.save({
-                        'model_config': config['model'],
-                        'step': i_step,
-                    }, f)
-                    checkpoint_bytes = f.getvalue()
-                if async_save:
-                    save_checkpoint_executor.submit(
-                        write_bytes_retry_loop, Path(workspace, 'checkpoint', 'latest.pt'), checkpoint_bytes
-                    )
-                else:
-                    write_bytes_retry_loop(Path(workspace, 'checkpoint', 'latest.pt'), checkpoint_bytes)
-
-                # Moving-average buffer (for ma1000/avg1000 metrics)
-                with io.BytesIO() as f:
-                    torch.save({
-                        'step': i_step,
-                        'ma_buffer': list(ma_buffer),
-                    }, f)
-                    checkpoint_bytes = f.getvalue()
-                if async_save:
-                    save_checkpoint_executor.submit(
-                        write_bytes_retry_loop, Path(workspace, 'checkpoint', 'latest_ma_buffer.pt'), checkpoint_bytes
-                    )
-                else:
-                    write_bytes_retry_loop(Path(workspace, 'checkpoint', 'latest_ma_buffer.pt'), checkpoint_bytes)
-
-            # Save model weight checkpoint
-            _is_permanent_ckpt = (i_step % checkpoint_every == 0) and (i_step != initial_step)
-            _is_rolling_ckpt = (i_step % rolling_checkpoint_every == 0) and (i_step != initial_step) and not _is_permanent_ckpt
-            _is_final_ckpt = (i_step == num_iterations - 1)
-            if accelerator.is_main_process and (_is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt):
-                save_ckpt()
-                # For rolling checkpoints, drop the previous rolling one. Record this step first
-                # so a crash before cleanup leaves it tracked rather than orphaned.
-                if _is_rolling_ckpt:
-                    record_rolling_ckpt(workspace, i_step)
-                    save_checkpoint_executor.submit(cleanup_old_rolling_ckpts, workspace, i_step)
+            checkpoint_saver.save_if_due(i_step)
 
             # Save data pipeline RNG state for all processes so data order can be resumed
-            if _is_permanent_ckpt or _is_rolling_ckpt or _is_final_ckpt:
+            if checkpoint_saver.is_due(i_step):
                 _pipeline_state_path = Path(workspace, 'checkpoint', f'latest_data_pipeline_rank_{accelerator.process_index}.pt')
                 _pipeline_state_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({'step': i_step, **train_data_pipeline.state_dict()}, _pipeline_state_path)
@@ -845,22 +473,7 @@ def main(
             if accelerator.is_main_process and i_step > 0 and i_step % 100 == 0:
                 pbar.write(f'[Step {i_step}] data pipeline profile:\n{train_data_pipeline.profile()}')
 
-            # On-demand checkpoint: monitor workspace/save_ckpt_at.txt every 100 steps
-            if accelerator.is_main_process and i_step % 100 == 0:
-                _demand_ckpt_path = Path(workspace, 'save_ckpt_at.txt')
-                if _demand_ckpt_path.exists():
-                    try:
-                        _demand_steps = {int(s.strip()) for s in _demand_ckpt_path.read_text().split() if s.strip().isdigit()}
-                        if i_step in _demand_steps:
-                            pbar.write(f'On-demand checkpoint triggered at step {i_step}')
-                            save_ckpt()
-                        _demand_steps = {s for s in _demand_steps if s > i_step}
-                        if _demand_steps:
-                            _demand_ckpt_path.write_text(' '.join(str(s) for s in sorted(_demand_steps)) + '\n')
-                        else:
-                            _demand_ckpt_path.unlink()
-                    except Exception as e:
-                        pbar.write(f'Error reading on-demand checkpoint file: {e}')
+            checkpoint_saver.poll_on_demand(i_step)
 
             if max_invalid_batches >= 0:
                 invalid_batch_abort_flag = torch.tensor(
@@ -875,61 +488,16 @@ def main(
                             i for i, flag in enumerate(gathered_invalid_batch_abort_flags.tolist()) if flag > 0
                         ]
                         pbar.write(f'Invalid batch threshold {max_invalid_batches} reached on ranks {triggered_ranks}, saving checkpoint before abort.')
-                        save_ckpt(async_save=False)
+                        checkpoint_saver.save(i_step, async_save=False)
                     accelerator.wait_for_everyone()
                     raise RuntimeError('Encountered too many invalid batches on at least one rank, abort training.')
 
             # Visualize
             if vis_every > 0 and accelerator.is_main_process and (i_step == initial_step or i_step % vis_every == 0 or i_step == num_iterations - 1):
-                unwrapped_model = accelerator.unwrap_model(model)
-                save_dir = Path(workspace).joinpath(f'vis/step_{i_step:08d}')
-                save_dir.mkdir(parents=True, exist_ok=True)
-                with torch.inference_mode():
-                    for i_batch, batch in enumerate(tqdm(batches_for_vis, desc=f'Visualize: {i_step:08d}', leave=False)):
-                        image = batch['image'].to(device)
-                        
-                        output = unwrapped_model.infer(image, refine_steps=0)
-                        pred_points_all = [points_step.cpu().numpy() for points_step in output['points_per_step']]
-                        if 'depth_per_step' in output:
-                            pred_depth_all = [depth_step.cpu().numpy() for depth_step in output['depth_per_step']]
-                        else:
-                            pred_depth = output['depth'].cpu().numpy()
-                            pred_depth_all = [pred_depth]
-                        pred_mask = output['mask'].cpu().numpy()
-                        image = image.cpu().numpy()
-
-                        for i_instance in range(image.shape[0]):
-                            idx = i_batch * batch_size_forward + i_instance
-                            image_i = (image[i_instance].transpose(1, 2, 0) * 255).astype(np.uint8)
-                            pred_mask_i = pred_mask[i_instance]
-                            save_dir.joinpath(f'{idx:04d}').mkdir(parents=True, exist_ok=True)
-                            # cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/image.jpg')), cv2.cvtColor(image_i, cv2.COLOR_RGB2BGR))
-                            cv2.imwrite(str(save_dir.joinpath(f'{idx:04d}/mask_train_step_{i_step:08d}.png')), pred_mask_i * 255)
-                            for i_refine_step, (points_step, depth_step) in enumerate(zip(pred_points_all, pred_depth_all)):
-                                pred_points_i = points_step[i_instance]
-                                pred_depth_i = depth_step[i_instance]
-                                cv2.imwrite(
-                                    str(save_dir.joinpath(f'{idx:04d}/points_train_step_{i_step:08d}_refine_step_{i_refine_step:02d}.exr')),
-                                    cv2.cvtColor(pred_points_i, cv2.COLOR_RGB2BGR),
-                                    [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT],
-                                )
-                                cv2.imwrite(
-                                    str(save_dir.joinpath(f'{idx:04d}/depth_vis_train_step_{i_step:08d}_refine_step_{i_refine_step:02d}.png')),
-                                    cv2.cvtColor(colorize_depth(pred_depth_i, pred_mask_i), cv2.COLOR_RGB2BGR),
-                                )
-                            if 'mlflow' in log_type_set:
-                                try:
-                                    # mlflow.log_image(image_i, key=f'{idx:04d}-image-pred', step=i_step)
-                                    # mlflow.log_image(pred_mask_i * 255, key=f'{idx:04d}-mask-pred', step=i_step)
-                                    for i_refine_step, depth_step in enumerate(pred_depth_all):
-                                        pred_depth_i = depth_step[i_instance]
-                                        mlflow.log_image(
-                                            colorize_depth(pred_depth_i, pred_mask_i),
-                                            key=f'{idx:04d}-depth_vis-pred-train-step-{i_step:06d}-refine-step-{i_refine_step:02d}',
-                                            step=i_step,
-                                        )
-                                except Exception as e:
-                                    print(f"Failed to log image to mlflow: {e}")
+                visualize_predictions(
+                    batches_for_vis, model, accelerator, workspace, device,
+                    batch_size_forward, i_step, refine_steps=0, logger=logger,
+                )
             pbar.update(1)
 
             if accelerator.is_main_process and (i_step % 10 == 0):
