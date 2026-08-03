@@ -245,7 +245,10 @@ def main(
     def load_checkpoint(ckpt_path: Optional[str]) -> Dict[str, Any]:
         with accelerator.local_main_process_first():
             checkpoint = None
-            if ckpt_path.endswith('.pt'):
+            if not ckpt_path or ckpt_path == 'none':
+                # - No checkpoint requested
+                pass
+            elif ckpt_path.endswith('.pt'):
                 # - Load specific checkpoint file
                 print(f'Load checkpoint: {ckpt_path}')
                 checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
