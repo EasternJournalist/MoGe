@@ -68,9 +68,9 @@ def boundary_f1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, radius
     )
     neighbor_mask = (neighbor_x ** 2 + neight_y ** 2) <= radius ** 2 + 1e-5
 
-    pred_window = utils3d.pt.sliding_window_2d(pred, window_size=2 * radius + 1, stride=1, dim=(-2, -1))                 # [H, W, 2*R+1, 2*R+1]
-    gt_window = utils3d.pt.sliding_window_2d(gt, window_size=2 * radius + 1, stride=1, dim=(-2, -1))                     # [H, W, 2*R+1, 2*R+1]
-    mask_window = neighbor_mask & utils3d.pt.sliding_window_2d(mask, window_size=2 * radius + 1, stride=1, dim=(-2, -1)) # [H, W, 2*R+1, 2*R+1]
+    pred_window = utils3d.pt.sliding_window(pred, window_size=2 * radius + 1, stride=1, dim=(-2, -1))                 # [H, W, 2*R+1, 2*R+1]
+    gt_window = utils3d.pt.sliding_window(gt, window_size=2 * radius + 1, stride=1, dim=(-2, -1))                     # [H, W, 2*R+1, 2*R+1]
+    mask_window = neighbor_mask & utils3d.pt.sliding_window(mask, window_size=2 * radius + 1, stride=1, dim=(-2, -1)) # [H, W, 2*R+1, 2*R+1]
 
     pred_rel = pred_window / pred[radius:-radius, radius:-radius, None, None]
     gt_rel = gt_window / gt[radius:-radius, radius:-radius, None, None]
