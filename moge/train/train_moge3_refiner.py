@@ -33,7 +33,6 @@ from .utils import (
     build_optimizer,
     build_lr_scheduler,
     to_device,
-    get_raft_weight,
     materialize_log_records,
     to_log_scalar,
     write_optimizer_param_assignment_log,
@@ -50,6 +49,83 @@ from ..test.metrics import compute_metrics
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
 torch._dynamo.config.disable = True
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
+
+# Refine-step pairs reported by the monitor tables below.
+_REFINE_STEP_PAIRS = [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]
+
+
+def split_step_suffix(key: str) -> Tuple[str, int]:
+    """Split a logged key into its base name and refine step: 'global_step_2' -> ('global', 2).
+
+    A key with no suffix is step 0, which is how step-0 losses are logged.
+    """
+    base, sep, step = key.rpartition('_step_')
+    return (base, int(step)) if sep else (key, 0)
+
+
+def accumulate_step_transitions(
+    values_by_step: Dict[str, Dict[int, float]],
+    tracker: Dict[Tuple, List[int]],
+    count_when: Callable[[float, float], bool],
+) -> None:
+    """Tally, per (name, step_from, step_to), how many instances satisfy `count_when`.
+
+    `tracker` accumulates `[count, total]`. What the count *means* is decided by
+    `count_when(value_at_to, value_at_from)` and must match how the corresponding
+    table reports it -- the loss tracker counts instances that got *worse* and its
+    table inverts, while the delta and error trackers count the outcome they name.
+    """
+    for name, step_vals in values_by_step.items():
+        for step_from, step_to in _REFINE_STEP_PAIRS:
+            if step_from in step_vals and step_to in step_vals:
+                entry = tracker.setdefault((name, step_from, step_to), [0, 0])
+                entry[1] += 1
+                if count_when(step_vals[step_to], step_vals[step_from]):
+                    entry[0] += 1
+
+
+def write_refine_monitor_table(
+    pbar,
+    i_step: int,
+    tracker: Dict[Tuple, Tuple[int, int]],
+    log: Dict[str, float],
+    title: str,
+    label: str,
+    log_prefix: str,
+    invert: bool = False,
+) -> None:
+    """Print one "% of instances that improved" table over refine-step transitions.
+
+    `tracker` maps (name, step_from, step_to) -> (count, total). The percentage
+    reported is `count / total`, or its complement when `invert` is set -- which
+    the loss table needs because it counts instances whose loss *increased* but
+    reports the fraction that decreased.
+
+    Consumes the tracker: it is cleared once written. Percentages are also
+    written into `log` under `log_prefix` for upload with the next metric batch.
+    """
+    if not tracker:
+        return
+    pbar.write(f'[Step {i_step}] {title}')
+    names = sorted({name for name, _, _ in tracker})
+    name_width = max(len(label), *(len(name) for name in names))
+    header = '  '.join(f'{f"{a}->{b}":>7s}' for a, b in _REFINE_STEP_PAIRS)
+    pbar.write(f'  {label:<{name_width}s}  {header}')
+    for name in names:
+        cells = []
+        for step_from, step_to in _REFINE_STEP_PAIRS:
+            entry = tracker.get((name, step_from, step_to))
+            if entry is None:
+                cells.append('      -')
+                continue
+            count, total = entry
+            # NOTE: a zero-total cell prints as N/A but is still logged as 0.0,
+            # so the metric's key set stays stable across steps.
+            pct = 100.0 * ((total - count) if invert else count) / total if total > 0 else 0.0
+            cells.append(f'{pct:6.1f}%' if total > 0 else '   N/A')
+            log[f'{log_prefix}/{name}_{step_from}_to_{step_to}'] = pct
+        pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
+    tracker.clear()
 
 
 @click.command()
@@ -245,8 +321,8 @@ def main(
             dump_grad_norm_above=config.get('dump_grad_norm_above', 10),
         )
         invalid_batch_encountered_times = 0
-        refine_regression_tracker: Dict[Tuple, List[int]] = {}
-        refine_regression_log: Dict[str, float] = {}
+        loss_decrease_tracker: Dict[Tuple, List[int]] = {}
+        loss_decrease_log: Dict[str, float] = {}
         delta_increase_tracker: Dict[Tuple, List[int]] = {}
         delta_increase_log: Dict[str, float] = {}
         error_decrease_tracker: Dict[Tuple, List[int]] = {}
@@ -290,7 +366,7 @@ def main(
                             num_tokens = random.Random(f'num_tokens-{seed}-{i_step}-{i_accumulate}').randint(*config['model']['num_tokens_range'])
                         
                         _detach_backbone = i_step < config['refiner_detach_backbone_until']
-                        with timeit('Model forward', verbose=False) as timer_forward: # , sync=torch.cuda.synchronize
+                        with timeit('Model forward', verbose=False) as timer_forward:
                             output = model(
                                 image,
                                 num_tokens=num_tokens,
@@ -302,7 +378,7 @@ def main(
                         pred_normal, pred_mask, pred_metric_scale = (output.get(k, None) for k in ['normal', 'mask', 'metric_scale'])
 
                         # Compute loss (per instance)
-                        with timeit('Loss computation', verbose=False) as timer_loss_computation: # , sync=torch.cuda.synchronize
+                        with timeit('Loss computation', verbose=False) as timer_loss_computation:
                             if is_invalid_batch:
                                 loss = torch.tensor(0.0, device=device, requires_grad=True)
                             else:
@@ -334,29 +410,13 @@ def main(
                                             if not is_refine_instance:
                                                 weight_dict[iter_key] = v['weight']
                                             else:
-                                                if config.get("loss_weight_balance", "mean") == "mean":
-                                                    if _detach_backbone:
-                                                        if pred_step == 0:
-                                                            weight_dict[iter_key] = v['weight']
-                                                        else:
-                                                            weight_dict[iter_key] = v['weight'] / config['refine_steps']
-                                                    else:
-                                                        weight_dict[iter_key] = v['weight'] / len(v['apply_steps'])
-                                                elif config["loss_weight_balance"] == "refine_steps_mean":
+                                                if _detach_backbone:
                                                     if pred_step == 0:
                                                         weight_dict[iter_key] = v['weight']
                                                     else:
                                                         weight_dict[iter_key] = v['weight'] / config['refine_steps']
-                                                elif config["loss_weight_balance"] == "raft":
-                                                    if _detach_backbone:
-                                                        if pred_step == 0:
-                                                            weight_dict[iter_key] = v['weight']
-                                                        else:
-                                                            weight_dict[iter_key] = v['weight'] * get_raft_weight(config['refine_steps'], pred_step - 1, config["raft_gamma"])
-                                                    else:
-                                                        weight_dict[iter_key] = v['weight'] * get_raft_weight(config['refine_steps'] + 1, pred_step, config["raft_gamma"])
                                                 else:
-                                                    raise ValueError(f"Unknown loss weight balance strategy: {config['loss_weight_balance']}")
+                                                    weight_dict[iter_key] = v['weight'] / len(v['apply_steps'])
 
                                             if v['function'] == 'affine_invariant_global_loss':
                                                 # For refine steps (pred_step > 0), reuse the step-0 scale so the
@@ -448,72 +508,38 @@ def main(
                                     # Monitor refine step regression (only for refine instances)
                                     if is_refine_instance and accelerator.is_main_process:
                                         loss_dict_for_monitor, misc_dict_for_monitor = materialize_log_records([loss_dict, misc_dict])
+
                                         monitor_loss_by_step: Dict[str, Dict[int, float]] = {}
                                         for lk, lv in loss_dict_for_monitor.items():
-                                            parts = lk.rsplit('_step_', 1)
-                                            if len(parts) == 2:
-                                                monitor_loss_by_step.setdefault(parts[0], {})[int(parts[1])] = lv
-                                            else:
-                                                # bare key = step 0
-                                                monitor_loss_by_step.setdefault(lk, {})[0] = lv
-                                        monitor_pairs = [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]
-                                        for name, step_vals in monitor_loss_by_step.items():
-                                            for s_from, s_to in monitor_pairs:
-                                                if s_from in step_vals and s_to in step_vals:
-                                                    tracker_key = (name, s_from, s_to)
-                                                    if tracker_key not in refine_regression_tracker:
-                                                        refine_regression_tracker[tracker_key] = [0, 0]
-                                                    refine_regression_tracker[tracker_key][1] += 1
-                                                    if step_vals[s_to] > step_vals[s_from]:
-                                                        refine_regression_tracker[tracker_key][0] += 1
+                                            base, step_num = split_step_suffix(lk)
+                                            monitor_loss_by_step.setdefault(base, {})[step_num] = lv
 
-                                        # Monitor misc delta increase and error decrease across refine steps
+                                        # Misc keys are '<name>[_step_N].<metric>'; only delta* and
+                                        # truncated_error are tracked across refine steps.
                                         misc_delta_by_step: Dict[str, Dict[int, float]] = {}
                                         misc_error_by_step: Dict[str, Dict[int, float]] = {}
                                         for mk, mv in misc_dict_for_monitor.items():
                                             dot_pos = mk.rfind('.')
                                             if dot_pos < 0:
                                                 continue
-                                            prefix = mk[:dot_pos]
+                                            base_name, step_num = split_step_suffix(mk[:dot_pos])
                                             metric_name = mk[dot_pos + 1:]
-                                            parts = prefix.rsplit('_step_', 1)
-                                            if len(parts) == 2:
-                                                base_name, step_str = parts
-                                                step_num = int(step_str)
-                                            else:
-                                                base_name = parts[0]
-                                                step_num = 0
                                             if metric_name == 'delta' or metric_name.startswith('delta_'):
-                                                delta_key = base_name if metric_name == 'delta' else base_name + '.' + metric_name
+                                                delta_key = base_name if metric_name == 'delta' else f'{base_name}.{metric_name}'
                                                 misc_delta_by_step.setdefault(delta_key, {})[step_num] = mv
                                             elif metric_name == 'truncated_error':
                                                 misc_error_by_step.setdefault(base_name, {})[step_num] = mv
 
-                                        for name, step_vals in misc_delta_by_step.items():
-                                            for s_from, s_to in monitor_pairs:
-                                                if s_from in step_vals and s_to in step_vals:
-                                                    tracker_key = (name, s_from, s_to)
-                                                    if tracker_key not in delta_increase_tracker:
-                                                        delta_increase_tracker[tracker_key] = [0, 0]
-                                                    delta_increase_tracker[tracker_key][1] += 1
-                                                    if step_vals[s_to] > step_vals[s_from]:
-                                                        delta_increase_tracker[tracker_key][0] += 1
-
-                                        for name, step_vals in misc_error_by_step.items():
-                                            for s_from, s_to in monitor_pairs:
-                                                if s_from in step_vals and s_to in step_vals:
-                                                    tracker_key = (name, s_from, s_to)
-                                                    if tracker_key not in error_decrease_tracker:
-                                                        error_decrease_tracker[tracker_key] = [0, 0]
-                                                    error_decrease_tracker[tracker_key][1] += 1
-                                                    if step_vals[s_to] < step_vals[s_from]:
-                                                        error_decrease_tracker[tracker_key][0] += 1
+                                        # Counted predicate must match how each table reports it.
+                                        accumulate_step_transitions(monitor_loss_by_step, loss_decrease_tracker, lambda to, fr: to > fr)
+                                        accumulate_step_transitions(misc_delta_by_step, delta_increase_tracker, lambda to, fr: to > fr)
+                                        accumulate_step_transitions(misc_error_by_step, error_decrease_tracker, lambda to, fr: to < fr)
 
                                 loss = sum(loss_list) / len(loss_list)  # Average over the batch
                             records.append({'train/loss': to_log_scalar(loss)})
 
                         # Backward
-                        with timeit('Backward', verbose=False) as timer_backward: # , sync=torch.cuda.synchronize
+                        with timeit('Backward', verbose=False) as timer_backward:
                             accelerator.backward(loss)
 
                         # Optimizer step
@@ -555,68 +581,26 @@ def main(
                     pbar.set_postfix({'loss': step_avg['train/loss']}, refresh=False)
             
                 if i_step != initial_step:
-                    if refine_regression_tracker:
-                        pbar.write(f'[Step {i_step}] Refine loss decrease% monitor (bigger=better):')
-                        names = sorted(set(n for n, _, _ in refine_regression_tracker))
-                        name_width = max(len('loss'), *(len(name) for name in names))
-                        pbar.write(f'  {"loss":<{name_width}s}  {"0->1":>7s}  {"1->2":>7s}  {"2->3":>7s}  {"0->3":>7s}  {"1->3":>7s}')
-                        for name in names:
-                            cells = []
-                            for s_from, s_to in [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]:
-                                key = (name, s_from, s_to)
-                                if key in refine_regression_tracker:
-                                    n_inc, n_total = refine_regression_tracker[key]
-                                    n_dec = n_total - n_inc
-                                    pct = 100.0 * n_dec / n_total if n_total > 0 else 0.0
-                                    cells.append(f'{pct:6.1f}%' if n_total > 0 else '   N/A')
-                                    refine_regression_log[f'loss_decrease/{name}_{s_from}_to_{s_to}'] = pct
-                                else:
-                                    cells.append('      -')
-                            pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
-                        refine_regression_tracker.clear()
-
-                    if delta_increase_tracker:
-                        pbar.write(f'[Step {i_step}] Misc delta increase% monitor (bigger=better):')
-                        names = sorted(set(n for n, _, _ in delta_increase_tracker))
-                        name_width = max(len('metric'), *(len(name) for name in names))
-                        pbar.write(f'  {"metric":<{name_width}s}  {"0->1":>7s}  {"1->2":>7s}  {"2->3":>7s}  {"0->3":>7s}  {"1->3":>7s}')
-                        for name in names:
-                            cells = []
-                            for s_from, s_to in [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]:
-                                key = (name, s_from, s_to)
-                                if key in delta_increase_tracker:
-                                    n_inc, n_total = delta_increase_tracker[key]
-                                    pct = 100.0 * n_inc / n_total if n_total > 0 else 0.0
-                                    cells.append(f'{pct:6.1f}%' if n_total > 0 else '   N/A')
-                                    delta_increase_log[f'delta_increase/{name}_{s_from}_to_{s_to}'] = pct
-                                else:
-                                    cells.append('      -')
-                            pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
-                        delta_increase_tracker.clear()
-
-                    if error_decrease_tracker:
-                        pbar.write(f'[Step {i_step}] Misc error decrease% monitor (bigger=better):')
-                        names = sorted(set(n for n, _, _ in error_decrease_tracker))
-                        name_width = max(len('metric'), *(len(name) for name in names))
-                        pbar.write(f'  {"metric":<{name_width}s}  {"0->1":>7s}  {"1->2":>7s}  {"2->3":>7s}  {"0->3":>7s}  {"1->3":>7s}')
-                        for name in names:
-                            cells = []
-                            for s_from, s_to in [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]:
-                                key = (name, s_from, s_to)
-                                if key in error_decrease_tracker:
-                                    n_dec, n_total = error_decrease_tracker[key]
-                                    pct = 100.0 * n_dec / n_total if n_total > 0 else 0.0
-                                    cells.append(f'{pct:6.1f}%' if n_total > 0 else '   N/A')
-                                    error_decrease_log[f'error_decrease/{name}_{s_from}_to_{s_to}'] = pct
-                                else:
-                                    cells.append('      -')
-                            pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
-                        error_decrease_tracker.clear()
+                    write_refine_monitor_table(
+                        pbar, i_step, loss_decrease_tracker, loss_decrease_log,
+                        title='Refine loss decrease% monitor (bigger=better):',
+                        label='loss', log_prefix='loss_decrease', invert=True,
+                    )
+                    write_refine_monitor_table(
+                        pbar, i_step, delta_increase_tracker, delta_increase_log,
+                        title='Misc delta increase% monitor (bigger=better):',
+                        label='metric', log_prefix='delta_increase',
+                    )
+                    write_refine_monitor_table(
+                        pbar, i_step, error_decrease_tracker, error_decrease_log,
+                        title='Misc error decrease% monitor (bigger=better):',
+                        label='metric', log_prefix='error_decrease',
+                    )
 
             # Log metrics
             if i_step != initial_step and i_step % log_every == 0:
                 _extra_scalars = {}
-                for _log in (refine_regression_log, delta_increase_log, error_decrease_log):
+                for _log in (loss_decrease_log, delta_increase_log, error_decrease_log):
                     _extra_scalars.update(_log)
                     _log.clear()
                 records = logger.log_metrics(

@@ -258,7 +258,7 @@ def main(
                         else:
                             num_tokens = random.Random(f'num_tokens-{seed}-{i_step}-{i_accumulate}').randint(*config['model']['num_tokens_range'])
                         
-                        with timeit('Model forward', verbose=False) as timer_forward: # , sync=torch.cuda.synchronize
+                        with timeit('Model forward', verbose=False) as timer_forward:
                             output = model(
                                 image,
                                 num_tokens=num_tokens,
@@ -268,7 +268,7 @@ def main(
                         pred_normal, pred_mask, pred_metric_scale = (output.get(k, None) for k in ['normal', 'mask', 'metric_scale'])
 
                         # Compute loss (grouped by label type)
-                        with timeit('Loss computation', verbose=False) as timer_loss_computation: # , sync=torch.cuda.synchronize
+                        with timeit('Loss computation', verbose=False) as timer_loss_computation:
                             if is_invalid_batch:
                                 loss = torch.tensor(0.0, device=device, requires_grad=True)
                             else:
@@ -416,7 +416,7 @@ def main(
                             records.append({'train/loss': to_log_scalar(loss)})
 
                         # Backward
-                        with timeit('Backward', verbose=False) as timer_backward: # , sync=torch.cuda.synchronize
+                        with timeit('Backward', verbose=False) as timer_backward:
                             accelerator.backward(loss)
 
                         # Optimizer step

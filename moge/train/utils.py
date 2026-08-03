@@ -158,11 +158,6 @@ def filter_outliers(values: List[float], sigma: float = 5.0) -> List[float]:
     return [v for v in values if abs(v - median) <= threshold]
 
 
-def get_raft_weight(total_step_count: int, step: int, gamma: float) -> float:
-    weight_sum = sum(gamma ** i for i in range(total_step_count))
-    return (gamma ** (total_step_count - 1 - step)) / weight_sum
-
-
 ROLLING_CKPT_MANIFEST = 'rolling_ckpts.json'
 
 
