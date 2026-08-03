@@ -179,3 +179,70 @@ accelerate launch \
     --vis_every 1000 \
     --enable_mlflow True
 ```
+
+
+## Training MoGe-3
+
+MoGe-3 is trained in two stages, each with its own entry point under `moge/train/`.
+Both are launched as modules from the repository root.
+
+### Stage 1 — pretraining
+
+Trains the encoder, neck and heads, without the refiner.
+
+```bash
+accelerate launch \
+    --num_processes 8 \
+    --module moge.train.train_moge3_pretrain \
+    --config configs/train/v3_pretrain.json \
+    --name my_run \
+    --workspace_path workspace/my_run \
+    --checkpoint latest \
+    --batch_size_forward 2 \
+    --gradient_accumulation_steps 2 \
+    --precision mixed_bf16 \
+    --vis_every 1000
+```
+
+### Stage 2 — refiner
+
+Adds the sparse point-cloud refiner on top of a stage-1 checkpoint. Pass that
+checkpoint with `--base_checkpoint`: it is used only when the workspace has no
+checkpoint of its own, so `--checkpoint latest` still resumes an interrupted run.
+The base checkpoint has no `refiner.*` weights, so the refiner keeps its
+freshly initialised values.
+
+```bash
+accelerate launch \
+    --num_processes 8 \
+    --module moge.train.train_moge3_refiner \
+    --config configs/train/v3_refiner.json \
+    --name my_refiner_run \
+    --workspace_path workspace/my_refiner_run \
+    --base_checkpoint workspace/my_run/checkpoint/latest.pt \
+    --checkpoint latest \
+    --batch_size_forward 1 \
+    --gradient_accumulation_steps 6 \
+    --precision mixed_bf16 \
+    --refiner_gradient_checkpoint True \
+    --vis_every 1000
+```
+
+The refiner config carries a few extra keys:
+
+| Key | Meaning |
+| --- | --- |
+| `refine_steps` | Number of refinement iterations per forward pass |
+| `refine_ratio` | Fraction of accumulation micro-batches drawn from `refine_data` rather than `norefine_data` |
+| `refiner_detach_backbone_until` | Step until which the refiner trains on detached encoder features |
+| `loss_weight_balance` | How per-refine-step losses are weighted: `mean`, `refine_steps_mean` or `raft` |
+
+Losses are configured per label type and per refine step; each term lists the
+`apply_steps` it contributes to. Datasets used only for refinement carry label
+`D` in the shipped config.
+
+### Logging
+
+Both scripts take `--log_type`, which may be repeated: `tensorboard` (the
+default), `wandb`, or `mlflow`. Only `wandb` and `tensorboard` are installed by
+the `train` extra; `mlflow` works if you install it yourself.
