@@ -307,6 +307,10 @@ def main(
                             weight_dict[k] = v['weight']
                             if v['function'] == 'affine_invariant_global_loss':
                                 loss_dict[k], misc_dict[k], gt_metric_scale, _ = affine_invariant_global_loss(pred_points[i], gt_points[i], gt_points_mask[i], **v['params'])
+                                # NOTE: The solved scale is consumed downstream as a target / alignment
+                                # constant, never as something to optimise through. Detaching here keeps
+                                # metric_scale_loss from being minimised by moving its own target.
+                                gt_metric_scale = gt_metric_scale.detach()
                             elif v['function'] == 'affine_invariant_local_loss':
                                 loss_dict[k], misc_dict[k] = affine_invariant_local_loss(pred_points[i], gt_points[i], gt_points_mask[i], gt_focal[i], gt_metric_scale, **v['params'])
                             elif v['function'] == 'normal_loss':

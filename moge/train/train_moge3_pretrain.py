@@ -609,7 +609,7 @@ def main(
                                         for k, v in label_loss_config.get('metric_scale', {}).items():
                                             weight = v['weight']
                                             if v['function'] == 'metric_scale_loss':
-                                                loss_value, misc_value = metric_scale_loss(pred_metric_scale.index_select(0, metric_indices), metric_scale_gt)
+                                                loss_value, misc_value = metric_scale_loss(pred_metric_scale.index_select(0, metric_indices), metric_scale_gt.detach())
                                             else:
                                                 raise ValueError(f"Unknown metric_scale loss function: {v['function']}")
                                             accumulate_group_loss(k, loss_value, weight, len(metric_positions))

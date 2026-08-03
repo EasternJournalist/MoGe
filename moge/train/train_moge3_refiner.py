@@ -621,7 +621,7 @@ def main(
                                         weight_dict[k] = v['weight']
                                         if v['function'] == 'metric_scale_loss':
                                             if is_metric[i] and pred_metric_scale is not None and step0_gt_metric_scale is not None:
-                                                loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], step0_gt_metric_scale)
+                                                loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], step0_gt_metric_scale.detach())
 
                                     weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
                                     loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
