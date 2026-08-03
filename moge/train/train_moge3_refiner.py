@@ -30,12 +30,15 @@ from ..utils.tools import timeit
 from moge.train.dataloader import TrainDataLoaderPipeline
 from moge.train.losses import *
 from .utils import (
+    accumulate_step_transitions,
     build_optimizer,
     build_lr_scheduler,
     to_device,
     materialize_log_records,
+    split_step_suffix,
     to_log_scalar,
     write_optimizer_param_assignment_log,
+    write_refine_monitor_table,
 )
 from ..utils.tools import key_average, flatten_nested_dict
 from .options import common_train_options
@@ -49,84 +52,6 @@ from ..test.metrics import compute_metrics
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
 torch._dynamo.config.disable = True
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
-
-# Refine-step pairs reported by the monitor tables below.
-_REFINE_STEP_PAIRS = [(0, 1), (1, 2), (2, 3), (0, 3), (1, 3)]
-
-
-def split_step_suffix(key: str) -> Tuple[str, int]:
-    """Split a logged key into its base name and refine step: 'global_step_2' -> ('global', 2).
-
-    A key with no suffix is step 0, which is how step-0 losses are logged.
-    """
-    base, sep, step = key.rpartition('_step_')
-    return (base, int(step)) if sep else (key, 0)
-
-
-def accumulate_step_transitions(
-    values_by_step: Dict[str, Dict[int, float]],
-    tracker: Dict[Tuple, List[int]],
-    count_when: Callable[[float, float], bool],
-) -> None:
-    """Tally, per (name, step_from, step_to), how many instances satisfy `count_when`.
-
-    `tracker` accumulates `[count, total]`. What the count *means* is decided by
-    `count_when(value_at_to, value_at_from)` and must match how the corresponding
-    table reports it -- the loss tracker counts instances that got *worse* and its
-    table inverts, while the delta and error trackers count the outcome they name.
-    """
-    for name, step_vals in values_by_step.items():
-        for step_from, step_to in _REFINE_STEP_PAIRS:
-            if step_from in step_vals and step_to in step_vals:
-                entry = tracker.setdefault((name, step_from, step_to), [0, 0])
-                entry[1] += 1
-                if count_when(step_vals[step_to], step_vals[step_from]):
-                    entry[0] += 1
-
-
-def write_refine_monitor_table(
-    pbar,
-    i_step: int,
-    tracker: Dict[Tuple, Tuple[int, int]],
-    log: Dict[str, float],
-    title: str,
-    label: str,
-    log_prefix: str,
-    invert: bool = False,
-) -> None:
-    """Print one "% of instances that improved" table over refine-step transitions.
-
-    `tracker` maps (name, step_from, step_to) -> (count, total). The percentage
-    reported is `count / total`, or its complement when `invert` is set -- which
-    the loss table needs because it counts instances whose loss *increased* but
-    reports the fraction that decreased.
-
-    Consumes the tracker: it is cleared once written. Percentages are also
-    written into `log` under `log_prefix` for upload with the next metric batch.
-    """
-    if not tracker:
-        return
-    pbar.write(f'[Step {i_step}] {title}')
-    names = sorted({name for name, _, _ in tracker})
-    name_width = max(len(label), *(len(name) for name in names))
-    header = '  '.join(f'{f"{a}->{b}":>7s}' for a, b in _REFINE_STEP_PAIRS)
-    pbar.write(f'  {label:<{name_width}s}  {header}')
-    for name in names:
-        cells = []
-        for step_from, step_to in _REFINE_STEP_PAIRS:
-            entry = tracker.get((name, step_from, step_to))
-            if entry is None:
-                cells.append('      -')
-                continue
-            count, total = entry
-            # NOTE: a zero-total cell prints as N/A but is still logged as 0.0,
-            # so the metric's key set stays stable across steps.
-            pct = 100.0 * ((total - count) if invert else count) / total if total > 0 else 0.0
-            cells.append(f'{pct:6.1f}%' if total > 0 else '   N/A')
-            log[f'{log_prefix}/{name}_{step_from}_to_{step_to}'] = pct
-        pbar.write(f'  {name:<{name_width}s}  {"  ".join(cells)}')
-    tracker.clear()
-
 
 @click.command()
 @common_train_options
