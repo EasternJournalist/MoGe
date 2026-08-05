@@ -27,7 +27,10 @@ def main(ctx: click.Context, baseline_code_path: str, config_path: str, oracle_m
     from tqdm import tqdm
     import torch
     import torch.nn.functional as F
-    import utils3d
+    try:
+        import utils3d_moge as utils3d
+    except ImportError:
+        import utils3d
 
     from moge.test.baseline import MGEBaselineInterface
     from moge.test.dataloader import EvalDataLoaderPipeline

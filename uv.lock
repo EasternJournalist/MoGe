@@ -1756,7 +1756,7 @@ dependencies = [
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "trimesh" },
-    { name = "utils3d" },
+    { name = "utils3d-moge" },
 ]
 
 [package.optional-dependencies]
@@ -1794,7 +1794,7 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.19", index = "https://download.pytorch.org/whl/cu130" },
     { name = "tqdm" },
     { name = "trimesh", specifier = ">=4.11" },
-    { name = "utils3d", git = "https://github.com/EasternJournalist/utils3d.git?rev=94d1037aabbce32dea9c07a7c4849525817a1615" },
+    { name = "utils3d-moge", git = "https://github.com/EasternJournalist/utils3d-moge.git?rev=62f09d58509485564e24d5d9f6aac9ee9ebc0c37" },
     { name = "wandb", marker = "extra == 'train'" },
 ]
 provides-extras = ["train", "app"]
@@ -3501,9 +3501,9 @@ wheels = [
 ]
 
 [[package]]
-name = "utils3d"
+name = "utils3d-moge"
 version = "1.7"
-source = { git = "https://github.com/EasternJournalist/utils3d.git?rev=94d1037aabbce32dea9c07a7c4849525817a1615#94d1037aabbce32dea9c07a7c4849525817a1615" }
+source = { git = "https://github.com/EasternJournalist/utils3d-moge.git?rev=62f09d58509485564e24d5d9f6aac9ee9ebc0c37#62f09d58509485564e24d5d9f6aac9ee9ebc0c37" }
 dependencies = [
     { name = "moderngl" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },

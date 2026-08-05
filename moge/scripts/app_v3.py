@@ -40,7 +40,10 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
     import flex_gemm
     flex_gemm.config.AUTOTUNE_MODE = 'never'
 
-    import utils3d
+    try:
+        import utils3d_moge as utils3d
+    except ImportError:
+        import utils3d
     from moge.utils.io import write_normal
     from moge.utils.vis import colorize_depth, colorize_normal
     from moge.model import import_model_class_by_version

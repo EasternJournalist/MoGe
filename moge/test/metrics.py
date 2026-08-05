@@ -4,7 +4,10 @@ from numbers import Number
 import torch
 import torch.nn.functional as F
 import numpy as np
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 
 from ..utils.geometry_torch import (
     weighted_mean, 

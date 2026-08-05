@@ -5,7 +5,10 @@ import importlib
 
 import click
 import torch
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 
 from moge.test.baseline import MGEBaselineInterface
 

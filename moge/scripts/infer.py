@@ -60,7 +60,10 @@ def main(
     from moge.utils.io import save_glb, save_ply
     from moge.utils.vis import colorize_depth, colorize_normal
     from moge.utils.geometry_numpy import depth_occlusion_edge_numpy
-    import utils3d
+    try:
+        import utils3d_moge as utils3d
+    except ImportError:
+        import utils3d
 
     device = torch.device(device_name)
 

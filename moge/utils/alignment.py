@@ -8,7 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import torch.types
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 
 
 def scatter_min(size: int, dim: int, index: torch.LongTensor, src: torch.Tensor) -> torch.return_types.min:

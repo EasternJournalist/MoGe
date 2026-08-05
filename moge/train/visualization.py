@@ -6,7 +6,10 @@ from typing import *
 import cv2
 import numpy as np
 import torch
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 from tqdm import tqdm
 
 from ..utils.vis import colorize_depth, colorize_normal

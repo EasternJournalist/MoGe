@@ -12,7 +12,10 @@ import torch.nn.functional as F
 import torch.utils
 import torch.utils.checkpoint
 import torch.version
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 from huggingface_hub import hf_hub_download
 
 

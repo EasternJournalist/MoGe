@@ -7,7 +7,10 @@ import numpy as np
 import torch
 from PIL import Image
 import cv2
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 import pipeline
 
 from ..utils.geometry_numpy import focal_to_fov_numpy, norm3d

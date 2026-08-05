@@ -4,7 +4,10 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift
 from .v2 import MoGeModel as MoGeModelV2

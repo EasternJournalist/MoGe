@@ -11,7 +11,10 @@ import torch.utils
 import torch.utils.checkpoint
 import torch.amp
 import torch.version
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 from huggingface_hub import hf_hub_download
 
 from ..utils.geometry_torch import normalized_view_plane_uv, recover_focal_shift, angle_diff_vec3

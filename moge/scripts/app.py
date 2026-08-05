@@ -37,7 +37,10 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
     except ImportError:
         HUGGINFACE_SPACES_INSTALLED = False
 
-    import utils3d
+    try:
+        import utils3d_moge as utils3d
+    except ImportError:
+        import utils3d
     from moge.utils.io import write_normal
     from moge.utils.vis import colorize_depth, colorize_normal
     from moge.model import import_model_class_by_version

@@ -17,7 +17,10 @@ import torch.version
 import accelerate
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
-import utils3d
+try:
+    import utils3d_moge as utils3d
+except ImportError:
+    import utils3d
 import click
 from tqdm import tqdm
 from copy import deepcopy

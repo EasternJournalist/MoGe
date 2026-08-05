@@ -23,7 +23,7 @@ dependencies = [
   "tqdm",
   "torch>=2.4",
   "torchvision>=0.19",
-  "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@94d1037aabbce32dea9c07a7c4849525817a1615",
+  "utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37",
   "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@1c511390d90226c00c101f34b84df26a0f8789b4",
   "flex-gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git@b2fadb29d41846c7981ade6801ffc689fae119cf",
 ]
