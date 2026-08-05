@@ -26,6 +26,8 @@ dependencies = [
   "utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37",
   "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@1c511390d90226c00c101f34b84df26a0f8789b4",
   "flex-gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git@b2fadb29d41846c7981ade6801ffc689fae119cf",
+  "gradio>=6.0",
+  "starlette",
 ]
 
 [project.urls]
@@ -43,11 +45,6 @@ train = [
   "wandb",
   "tensorboard>=2.14",
   "mlflow>=3.1.1",
-]
-
-app = [
-  "gradio>=6.0",
-  "starlette",
 ]
 
 [tool.setuptools.packages.find]

@@ -7,6 +7,6 @@
 #   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
 #
 # This installs the base package, which covers inference for all model versions.
-# The Gradio demo and the training dependencies live in the `app` and `train`
-# extras -- see the installation section in README.md.
+# The training dependencies live in the  `train` extras -- 
+# see the installation section in README.md.
 -e .

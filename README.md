@@ -59,7 +59,6 @@ The following optional extras are available:
 
 | Extra | Contents |
 | --- | --- |
-| `app` | `gradio` — needed only for the `moge app` demo |
 | `train` | `accelerate`, `wandb`, `tensorboard`, `mlflow`, … — see [`docs/train.md`](docs/train.md) |
 
 ### Using uv (recommended)
@@ -68,9 +67,7 @@ The following optional extras are available:
 git clone https://github.com/microsoft/MoGe.git
 cd MoGe
 uv sync                             # inference, all model versions
-# uv sync --extra app               # ... plus the Gradio demo
 # uv sync --extra train             # ... plus the training dependencies
-# uv sync --extra app --extra train
 ```
 
 This creates a `.venv/` and installs MoGe into it in editable mode. Prefix commands with `uv run` (e.g. `uv run moge infer ...`), or activate the environment with `source .venv/bin/activate`.
@@ -89,7 +86,7 @@ cd MoGe
 pip install -e .
 ```
 
-Extras work the same way here: `pip install -e ".[app,train]"`.
+Extras work the same way here: `pip install -e ".[train]"`.
 
 ### Choosing a PyTorch build
 
@@ -214,9 +211,8 @@ For more usage details, see the `MoGeModel.infer()` docstring.
 ## 💡 Usage
 
 ### Gradio demo | `moge app`
-
-> Requires the `app` extra (`uv sync --extra app`, or `pip install -e ".[app]"`).
-> The demo for MoGe-1 is also available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe).
+> The demo for MoGe-1 is available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe).
+> The demo for MoGe-2 is available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe-2).
 
 ```bash
 # Using the command line tool

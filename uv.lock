@@ -1739,6 +1739,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "flex-gemm" },
+    { name = "gradio" },
     { name = "huggingface-hub" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1752,6 +1753,7 @@ dependencies = [
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "starlette" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -1760,10 +1762,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-app = [
-    { name = "gradio" },
-    { name = "starlette" },
-]
 train = [
     { name = "accelerate" },
     { name = "mlflow" },
@@ -1777,7 +1775,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'train'", specifier = ">=1.12.0" },
     { name = "click", specifier = ">=8.3.1" },
     { name = "flex-gemm", git = "https://github.com/JeffreyXiang/FlexGEMM.git?rev=b2fadb29d41846c7981ade6801ffc689fae119cf" },
-    { name = "gradio", marker = "extra == 'app'", specifier = ">=6.0" },
+    { name = "gradio", specifier = ">=6.0" },
     { name = "huggingface-hub" },
     { name = "matplotlib" },
     { name = "mlflow", marker = "extra == 'train'", specifier = ">=3.1.1" },
@@ -1787,7 +1785,7 @@ requires-dist = [
     { name = "pipeline", git = "https://github.com/EasternJournalist/pipeline.git?rev=1c511390d90226c00c101f34b84df26a0f8789b4" },
     { name = "requests" },
     { name = "scipy", specifier = ">=1.8" },
-    { name = "starlette", marker = "extra == 'app'" },
+    { name = "starlette" },
     { name = "sympy", marker = "extra == 'train'", specifier = ">=1.12" },
     { name = "tensorboard", marker = "extra == 'train'", specifier = ">=2.14" },
     { name = "torch", specifier = ">=2.4", index = "https://download.pytorch.org/whl/cu130" },
@@ -1797,7 +1795,7 @@ requires-dist = [
     { name = "utils3d-moge", git = "https://github.com/EasternJournalist/utils3d-moge.git?rev=62f09d58509485564e24d5d9f6aac9ee9ebc0c37" },
     { name = "wandb", marker = "extra == 'train'" },
 ]
-provides-extras = ["train", "app"]
+provides-extras = ["train"]
 
 [[package]]
 name = "mpmath"
