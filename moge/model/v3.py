@@ -238,6 +238,30 @@ class MoGeModel(MoGeModelV2):
         refine_steps: int = 3,
         use_fp16: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        """
+        User-friendly inference function
+
+        ### Parameters
+        - `image`: input image tensor of shape (B, 3, H, W) or (3, H, W).
+        - `num_tokens`: the number of base ViT tokens to use for inference. If None, it is determined by `resolution_level`.
+        - `resolution_level`: inference resolution level from 0 to 9. Higher values use more tokens and preserve finer details. Default: 9.
+        - `force_projection`: if True, recompute each point map from its depth map and intrinsics. Default: True.
+        - `apply_mask`: if True, mask invalid points and depths using the predicted mask. Default: True.
+        - `fov_x`: horizontal camera field of view in degrees. If None, it is inferred independently for each refinement step. Default: None.
+        - `refine_steps`: number of sparse 3D refinement updates. The output lists contain `refine_steps + 1` entries, including the initial prediction. Default: 3.
+        - `use_fp16`: if True, use mixed precision to speed up inference. Default: False.
+
+        ### Returns
+        A dictionary containing the following keys when the corresponding outputs are available:
+        - `points`: final camera-space point map of shape (B, H, W, 3) or (H, W, 3).
+        - `points_per_step`: point maps for the initial prediction and every refinement step.
+        - `intrinsics`: camera intrinsics associated with the final point map, of shape (B, 3, 3) or (3, 3).
+        - `intrinsics_per_step`: camera intrinsics for the initial prediction and every refinement step.
+        - `depth`: final depth map of shape (B, H, W) or (H, W).
+        - `depth_per_step`: depth maps for the initial prediction and every refinement step.
+        - `mask`: predicted valid-pixel mask of shape (B, H, W) or (H, W).
+        - `normal`: predicted normal map of shape (B, H, W, 3) or (H, W, 3).
+        """
         if refine_steps > 0 and not hasattr(self, 'refiner'):
             raise ValueError("Refiner is not enabled but refine_steps > 0.")
 
