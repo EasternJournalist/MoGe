@@ -51,21 +51,62 @@ https://github.com/user-attachments/assets/8f9ae680-659d-4f7f-82e2-b9ed9d6b988a
 
 ## 📦 Installation
 
-### Install via pip
-  
-```bash
-pip install git+https://github.com/microsoft/MoGe.git
-```
+Requires Python 3.10 or newer. Dependencies are declared in `pyproject.toml`, which works with both [uv](https://docs.astral.sh/uv/) and pip.
 
-### Or clone this repository
+> macOS is not supported: MoGe-3 depends on [FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM), which builds on Triton, and Triton publishes no macOS wheels.
+
+The following optional extras are available:
+
+| Extra | Contents |
+| --- | --- |
+| `app` | `gradio` — needed only for the `moge app` demo |
+| `train` | `accelerate`, `wandb`, `tensorboard`, `mlflow`, … — see [`docs/train.md`](docs/train.md) |
+
+### Using uv (recommended)
 
 ```bash
 git clone https://github.com/microsoft/MoGe.git
 cd MoGe
-pip install -r requirements.txt   # install the requirements
+uv sync                             # inference, all model versions
+# uv sync --extra app               # ... plus the Gradio demo
+# uv sync --extra train             # ... plus the training dependencies
+# uv sync --extra app --extra train
 ```
 
-Note: MoGe should be compatible with most requirements versions. Please check the `requirements.txt` for more details if you encounter any dependency issues.
+This creates a `.venv/` and installs MoGe into it in editable mode. Prefix commands with `uv run` (e.g. `uv run moge infer ...`), or activate the environment with `source .venv/bin/activate`.
+
+### Using pip
+
+```bash
+pip install git+https://github.com/microsoft/MoGe.git
+```
+
+Or from a clone, which is what you want if you intend to edit the code:
+
+```bash
+git clone https://github.com/microsoft/MoGe.git
+cd MoGe
+pip install -e .
+```
+
+Extras work the same way here: `pip install -e ".[app,train]"`.
+
+### Choosing a PyTorch build
+
+With uv there is nothing to choose: `pyproject.toml` pins `torch` and `torchvision` to the **CUDA 13.0** wheel index. To target a different CUDA version, either edit the index URL in `pyproject.toml`, or reinstall PyTorch into the synced environment:
+
+```bash
+uv pip install --torch-backend=cu128 torch torchvision --reinstall
+# --torch-backend=auto picks a build matching your installed driver
+```
+
+pip does not read uv's index configuration, so a plain `pip install` takes whatever PyPI serves. Pass the index you want explicitly:
+
+```bash
+pip install -e . --index-url https://download.pytorch.org/whl/cu130
+```
+
+Note: MoGe should be compatible with most dependency versions — the bounds in `pyproject.toml` are deliberately loose. Please check them for details if you encounter any dependency issues.
 
 ## 🤗 Pretrained Models
 
@@ -174,6 +215,7 @@ For more usage details, see the `MoGeModel.infer()` docstring.
 
 ### Gradio demo | `moge app`
 
+> Requires the `app` extra (`uv sync --extra app`, or `pip install -e ".[app]"`).
 > The demo for MoGe-1 is also available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe).
 
 ```bash

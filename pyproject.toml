@@ -1,86 +1,70 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "moge"
 version = "3.0.0"
 description = "MoGe-3: Fine-Detail Monocular Geometry Estimation with Self-Guided Sparse Volumetric Refinement"
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = "==3.13.*"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
 dependencies = [
-    "click>=8.3.1",
-    "opencv-python-headless==4.10.0.84",
-    "scikit-learn>=1.8.0",
-    "pillow>=12.1.1",
-    "matplotlib>=3.10.8",
-    "trimesh>=4.11.2",
-    "sympy>=1.14.0",
-    "numpy==2.2.6",
-    "python-dateutil>=2.9.0.post0",
-    "pytz>=2025.2",
-    "wrapt>=2.1.1",
-    "pipeline",
-    "gradio",
-    "utils3d",
+  "click>=8.3.1",
+  "numpy>=2",
+  "opencv-python-headless==4.10.0.84",
+  "scipy>=1.8",
+  "pillow",
+  "matplotlib",
+  "trimesh>=4.11",
+  "huggingface-hub",
+  "requests",
+  "tqdm",
+  "torch>=2.4",
+  "torchvision>=0.19",
+  "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@94d1037aabbce32dea9c07a7c4849525817a1615",
+  "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@1c511390d90226c00c101f34b84df26a0f8789b4",
+  "flex-gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git@b2fadb29d41846c7981ade6801ffc689fae119cf",
 ]
+
+[project.urls]
+Homepage = "https://github.com/microsoft/MoGe"
+Repository = "https://github.com/microsoft/MoGe"
+Issues = "https://github.com/microsoft/MoGe/issues"
+
+[project.scripts]
+moge = "moge.scripts.cli:main"
 
 [project.optional-dependencies]
-cu130 = [
-  "torch==2.10.0+cu130",
-  "torchvision==0.25.0+cu130",
-  "accelerate>=1.12.0",
-  "open-clip-torch>=3.2.0",
-  "flex-gemm",
-]
-
-cu128 = [
-  "torch==2.10.0+cu128",
-  "torchvision==0.25.0+cu128",
-  "accelerate>=1.12.0",
-  "open-clip-torch>=3.2.0",
-  "flex-gemm",
-]
-
 train = [
-  "wandb>=0.25.0",
-  "gitpython>=3.1.43",
-  "tensorboard>=2.20.0",
+  "accelerate>=1.12.0",
+  "sympy>=1.12",
+  "wandb",
+  "tensorboard>=2.14",
+  "mlflow>=3.1.1",
 ]
 
-dev = [
-  "ipykernel"
+app = [
+  "gradio>=6.0",
+  "starlette",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["moge*"]
 
 [tool.uv]
-environments = ["sys_platform == 'linux'"]
-conflicts = [
-  [
-    { extra = "cu130" },
-    { extra = "cu128" },
-  ],
-]
-prerelease = "if-necessary-or-explicit"
+environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
+# PTo target a different CUDA version, either change the index URL above, 
+# or reinstall into the synced environment with
+# `uv pip install --torch-backend=cu128 torch torchvision --reinstall`.
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cu130", extra = "cu130" },
-  { index = "pytorch-cu128", extra = "cu128" },
-]
-torchvision = [
-  { index = "pytorch-cu130", extra = "cu130" },
-  { index = "pytorch-cu128", extra = "cu128" },
-]
-pipeline = { git = "https://github.com/EasternJournalist/pipeline.git" }
-utils3d = { git = "https://github.com/EasternJournalist/utils3d.git", rev = "94d1037aabbce32dea9c07a7c4849525817a1615" }
-flex-gemm = { git = "https://github.com/JeffreyXiang/FlexGEMM.git", rev = "b2fadb29d41846c7981ade6801ffc689fae119cf" }
-
-[tool.uv.extra-build-dependencies]
-flex-gemm = [{ requirement = "torch", match-runtime = true }]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
