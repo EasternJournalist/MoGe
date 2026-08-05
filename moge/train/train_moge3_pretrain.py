@@ -20,7 +20,6 @@ from accelerate.utils import set_seed
 import utils3d
 import click
 from tqdm import tqdm
-import git
 from copy import deepcopy
 import shutil
 import warnings
@@ -160,16 +159,7 @@ def main(
     # Initialize training data pipeline
     dataloader_seed = (seed + accelerator.process_index) if seed is not None else None
     with accelerator.local_main_process_first():
-        data_to_use = None
-        if 'refine_data' in config and len(config['refine_data']['datasets']) > 0:
-            print(f"Warning: config['refine_data'] is present with {len(config['refine_data']['datasets'])} datasets, but it will be ignored.")
-        if 'data' in config:
-            print(f"Using config['data']. {len(config['data']['datasets'])} datasets found.")
-            data_to_use = config['data']
-        else:
-            print(f"Using config['norefine_data']. {len(config['norefine_data']['datasets'])} datasets found.")
-            data_to_use = config['norefine_data']
-        train_data_pipeline = TrainDataLoaderPipeline(data_to_use, batch_size_forward, workspace=workspace, num_load_workers=num_load_workers, num_process_workers=num_process_workers, seed=dataloader_seed)
+        train_data_pipeline = TrainDataLoaderPipeline(config['data'], batch_size_forward, workspace=workspace, num_load_workers=num_load_workers, num_process_workers=num_process_workers, seed=dataloader_seed)
 
     # Restore data pipeline RNG state if resuming
     if initial_step > 0:
@@ -245,8 +235,6 @@ def main(
                         is_invalid_batch = True
                         print(f"Rank {accelerator.process_index} all-invalid batch at step {i_step}, accumulation {i_accumulate}. Batch info: {info}")
                         invalid_batch_encountered_times += 1
-                    
-                    refine_steps = 0
 
                     gt_points = utils3d.pt.depth_map_to_point_map(gt_depth, intrinsics=gt_intrinsics)
                     gt_focal = 1 / (1 / gt_intrinsics[..., 0, 0] ** 2 + 1 / gt_intrinsics[..., 1, 1] ** 2) ** 0.5
@@ -262,7 +250,7 @@ def main(
                             output = model(
                                 image,
                                 num_tokens=num_tokens,
-                                refine_steps=refine_steps
+                                refine_steps=0
                             )
                         pred_points_all, delta_z_all = (output.get(k, None) for k in ['points_per_step', 'delta_z_per_update'])
                         pred_normal, pred_mask, pred_metric_scale = (output.get(k, None) for k in ['normal', 'mask', 'metric_scale'])

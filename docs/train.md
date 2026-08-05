@@ -5,13 +5,14 @@ This document provides instructions for training and finetuning the MoGe model.
 
 ## Additional Requirements
 
-The following packages other than those listed in [`pyproject.toml`](../pyproject.toml) are required for training and finetuning the MoGe model:
+Training needs the `train` extra declared in [`pyproject.toml`](../pyproject.toml):
 
+```bash
+uv sync --extra train           # or: pip install -e ".[train]"
 ```
-accelerate
-sympy
-mlflow
-```
+
+It adds `accelerate` (used for distributed training), `sympy`, and all three
+logging backends: `tensorboard`, `wandb` and `mlflow`.
 
 ## Data preparation
 
@@ -244,5 +245,5 @@ Losses are configured per label type and per refine step; each term lists the
 ### Logging
 
 Both scripts take `--log_type`, which may be repeated: `tensorboard` (the
-default), `wandb`, or `mlflow`. Only `wandb` and `tensorboard` are installed by
-the `train` extra; `mlflow` works if you install it yourself.
+default), `wandb`, or `mlflow`. All three backends are installed by the `train`
+extra.

@@ -21,7 +21,6 @@ from accelerate.utils import set_seed
 import utils3d
 import click
 from tqdm import tqdm
-import git
 from copy import deepcopy
 import shutil
 import warnings
