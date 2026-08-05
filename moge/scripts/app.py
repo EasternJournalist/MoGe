@@ -12,16 +12,17 @@ from typing import *
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 import shutil
-
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 import click
 
 
 @click.command(help='Web demo')
 @click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='The name or path of the pre-trained model.')
-@click.option('--version', 'model_version', default='v2', help='The version of the model.')
+@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
+@click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
 @click.option('--fp16', 'use_fp16', is_flag=True, help='Whether to use fp16 inference.')
-def main(share: bool, pretrained_model_name_or_path: str, model_version: str, use_fp16: bool):
+def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
     print("Import modules...")
     # Lazy import
     import cv2
@@ -37,6 +38,10 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
     except ImportError:
         HUGGINFACE_SPACES_INSTALLED = False
 
+    if model_version == 'v3':
+        import flex_gemm
+        flex_gemm.config.AUTOTUNE_MODE = 'never'
+
     try:
         import utils3d_moge as utils3d
     except ImportError:
@@ -49,14 +54,14 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
 
     print("Load model...")
     if pretrained_model_name_or_path is None:
-        DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION = {
-            "v1": "Ruicheng/moge-vitl",
-            "v2": "Ruicheng/moge-2-vitl-normal",
+        default_pretrained_models = {
+            'v1': 'Ruicheng/moge-vitl',
+            'v2': 'Ruicheng/moge-2-vitl-normal',
         }
-        pretrained_model_name_or_path = DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION[model_version]
+        if model_version == 'v3':
+            raise click.UsageError('MoGe-3 checkpoints are not released to Huggingface yet. Please provide a local path to the checkpoint.')
+        pretrained_model_name_or_path = default_pretrained_models[model_version]
     model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).cuda().eval()
-    if use_fp16:
-        model.half()
     thread_pool_executor = ThreadPoolExecutor(max_workers=1)
 
     def delete_later(path: Union[str, os.PathLike], delay: int = 300):
@@ -73,14 +78,21 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
 
     # Inference on GPU. 
     @(spaces.GPU if HUGGINFACE_SPACES_INSTALLED else lambda x: x)
-    def run_with_gpu(image: np.ndarray, resolution_level: int, apply_mask: bool) -> Dict[str, np.ndarray]:
-        image_tensor = torch.tensor(image, dtype=torch.float32 if not use_fp16 else torch.float16, device=torch.device('cuda')).permute(2, 0, 1) / 255
-        output = model.infer(image_tensor, apply_mask=apply_mask, resolution_level=resolution_level, use_fp16=use_fp16)
-        output = {k: v.cpu().numpy() for k, v in output.items()}
+    def run_with_gpu(image: np.ndarray, resolution_level: int, apply_mask: bool, refine_steps: int) -> Dict[str, np.ndarray]:
+        image_tensor = torch.tensor(image, dtype=torch.float32, device=torch.device('cuda')).permute(2, 0, 1) / 255
+        infer_kwargs = {
+            'apply_mask': apply_mask,
+            'resolution_level': resolution_level,
+            'use_fp16': use_fp16,
+        }
+        if model_version == 'v3':
+            infer_kwargs['refine_steps'] = refine_steps
+        output = model.infer(image_tensor, **infer_kwargs)
+        output = {k: v.cpu().numpy() for k, v in output.items() if isinstance(v, torch.Tensor)}
         return output
 
     # Full inference pipeline
-    def run(image: np.ndarray, max_size: int = 800, resolution_level: str = 'High',  apply_mask: bool = True, remove_edge: bool = True, request: gr.Request = None):
+    def run(image: np.ndarray, max_size: int = 800, resolution_level: str = 'High',   apply_mask: bool = True, remove_edge: bool = True, refine_steps: int = 3, request: gr.Request = None):
         larger_size = max(image.shape[:2])
         if larger_size > max_size:
             scale = max_size / larger_size
@@ -89,12 +101,14 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
         height, width = image.shape[:2]
 
         resolution_level_int = {'Low': 0, 'Medium': 5, 'High': 9, 'Ultra': 30}.get(resolution_level, 9)
-        output = run_with_gpu(image, resolution_level_int, apply_mask)
+        output = run_with_gpu(image, resolution_level_int, apply_mask, refine_steps)
 
-        points, depth, mask, normal = output['points'], output['depth'], output['mask'], output.get('normal', None)
+        points, depth, mask = output['points'], output['depth'], output['mask']
+        normal = output.get('normal')
 
         if remove_edge:
-            mask_cleaned = mask & ~utils3d.np.depth_map_edge(depth, rtol=0.04)
+            edge = utils3d.np.depth_map_edge(depth, ltol=0.02)
+            mask_cleaned = mask & ~edge
         else:
             mask_cleaned = mask
         
@@ -106,34 +120,19 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
 
         # depth & normal visualization
         depth_vis = colorize_depth(depth)
-        if normal is not None:
-            normal_vis = colorize_normal(normal)
-        else:
-            normal_vis = gr.update(label="Normal map (not avalable for this model)")
+        normal_vis = colorize_normal(normal) if normal is not None else None
+        mask_vis = mask_cleaned.astype(np.uint8) * 255
 
         # mesh & pointcloud
-        if normal is None:
-            faces, vertices, vertex_colors, vertex_uvs = utils3d.np.build_mesh_from_map(
-                points,
-                image.astype(np.float32) / 255,
-                utils3d.np.uv_map(height, width),
-                mask=mask_cleaned,
-                tri=True
-            )
-            vertex_normals = None
-        else:
-            faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.np.build_mesh_from_map(
-                points,
-                image.astype(np.float32) / 255,
-                utils3d.np.uv_map(height, width),
-                normal,
-                mask=mask_cleaned,
-                tri=True
-            )
+        faces, vertices, vertex_colors, vertex_uvs = utils3d.np.build_mesh_from_map(
+            points,
+            image.astype(np.float32) / 255,
+            utils3d.np.uv_map((height, width)),
+            mask=mask_cleaned,
+            tri=True
+        )
         vertices = vertices * np.array([1, -1, -1], dtype=np.float32) 
         vertex_uvs = vertex_uvs * np.array([1, -1], dtype=np.float32) + np.array([0, 1], dtype=np.float32)
-        if vertex_normals is not None:
-            vertex_normals = vertex_normals * np.array([1, -1, -1], dtype=np.float32)
 
         tempdir = Path(tempfile.gettempdir(), 'moge')
         tempdir.mkdir(exist_ok=True)
@@ -141,7 +140,7 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
         shutil.rmtree(output_path, ignore_errors=True)
         output_path.mkdir(exist_ok=True, parents=True)
         trimesh.Trimesh(
-            vertices=vertices,
+            vertices=vertices * np.array([-1, 1, -1], dtype=np.float32),
             faces=faces, 
             visual = trimesh.visual.texture.TextureVisuals(
                 uv=vertex_uvs, 
@@ -151,27 +150,27 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
                     roughnessFactor=1.0
                 )
             ),
-            vertex_normals=vertex_normals,
             process=False
         ).export(output_path / 'mesh.glb')
-        pointcloud = trimesh.PointCloud(
+        trimesh.Trimesh(
             vertices=vertices, 
-            colors=vertex_colors,
-        )
-        pointcloud.vertex_normals = vertex_normals
-        pointcloud.export(output_path / 'pointcloud.ply', vertex_normal=True)
+            faces=faces, 
+            vertex_colors=vertex_colors,
+            process=False
+        ).export(output_path / 'mesh.ply')
         trimesh.PointCloud(
             vertices=vertices, 
             colors=vertex_colors,
-        ).export(output_path / 'pointcloud.glb', include_normals=True)
-        cv2.imwrite(str(output_path /'mask.png'), mask.astype(np.uint8) * 255)
+        ).export(output_path / 'pointcloud.glb')
+        trimesh.PointCloud(
+            vertices=vertices, 
+            colors=vertex_colors,
+        ).export(output_path / 'pointcloud.ply')
         cv2.imwrite(str(output_path / 'depth.exr'), depth.astype(np.float32), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
         cv2.imwrite(str(output_path / 'points.exr'), cv2.cvtColor(points.astype(np.float32), cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT])
+        files = ['mesh.glb', 'mesh.ply', 'pointcloud.glb', 'pointcloud.ply', 'depth.exr', 'points.exr']
         if normal is not None:
             cv2.imwrite(str(output_path / 'normal.exr'), cv2.cvtColor(normal.astype(np.float32) * np.array([1, -1, -1], dtype=np.float32), cv2.COLOR_RGB2BGR), [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF])
-
-        files = ['mesh.glb', 'pointcloud.ply', 'depth.exr', 'points.exr', 'mask.png']
-        if normal is not None:
             files.append('normal.exr')
 
         for f in files:
@@ -193,9 +192,10 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
             results,
             depth_vis,
             normal_vis, 
+            mask_vis,
             output_path / 'pointcloud.glb', 
-            [(output_path / f).as_posix() for f in files if (output_path / f).exists()],
-            f'- **Horizontal FOV: {fov_x:.1f}°**. \n - **Vertical FOV: {fov_y:.1f}°**',
+            [(output_path / f).as_posix() for f in files],
+            f'**Horizontal FOV: {fov_x:.1f}°. Vertical FOV: {fov_y:.1f}°**',
             viewer_message,
             depth_message
         )
@@ -231,13 +231,13 @@ def main(share: bool, pretrained_model_name_or_path: str, model_version: str, us
             return [image, measure_points, depth_text]
         
     print("Create Gradio app...")
+    model_names = {'v1': 'MoGe-1', 'v2': 'MoGe-2', 'v3': 'MoGe-3'}
+    model_urls = {'v1': 'https://wangrc.site/MoGePage/', 'v2': 'https://wangrc.site/MoGe2Page/', 'v3': 'https://qft-333.github.io/moge3page/'}
+    model_name = model_names[model_version]
     with gr.Blocks() as demo:
         gr.Markdown(
-f'''
-<div align="center">
-<h1> Turn a 2D image into 3D with MoGe <a title="Github" href="https://github.com/microsoft/MoGe" target="_blank" rel="noopener noreferrer" style="display: inline-block;"> <img src="https://img.shields.io/github/stars/microsoft/MoGe?label=GitHub%20%E2%98%85&logo=github&color=C8C" alt="badge-github-stars"> </a> </h1>
-</div>
-''')
+            f"## Turn a 2D image into a 3D point map with [{model_name}]({model_urls[model_version]})\n Model: {pretrained_model_name_or_path}"
+        )
         results = gr.State(value=None)
         measure_points = gr.State(value=[])
 
@@ -245,11 +245,12 @@ f'''
             with gr.Column():
                 input_image = gr.Image(type="numpy", image_mode="RGB", label="Input Image")
                 with gr.Accordion(label="Settings", open=False):
-                    max_size_input = gr.Number(value=800, label="Maximum Image Size", precision=0, minimum=256, maximum=2048)
+                    max_size_input = gr.Number(value=800, label="Maximum Image Size", precision=0, minimum=256, maximum=4096)
+                    refine_steps = gr.Number(value=3 if hasattr(model, 'refiner') else 0, label="Refine Steps", precision=0, minimum=0, maximum=5, visible=hasattr(model, 'refiner'))
                     resolution_level = gr.Dropdown(['Low', 'Medium', 'High', 'Ultra'], label="Inference Resolution Level", value='High')
                     apply_mask = gr.Checkbox(value=True, label="Apply mask")
                     remove_edges = gr.Checkbox(value=True, label="Remove edges")
-                submit_btn = gr.Button("Submit", variant='primary')
+                submit_btn = gr.Button("Submit")
 
             with gr.Column():
                 with gr.Tabs():
@@ -260,18 +261,21 @@ f'''
                     with gr.Tab("Depth"):
                         depth_message = gr.Markdown("")
                         depth_map = gr.Image(type="numpy", label="Colorized Depth Map", format='png', interactive=False)
-                    with gr.Tab("Normal", interactive=hasattr(model, 'normal_head')):
+                    with gr.Tab("Normal", visible=hasattr(model, 'normal_head')):
                         normal_map = gr.Image(type="numpy", label="Normal Map", format='png', interactive=False)
+                    with gr.Tab("Mask"):
+                        mask_map = gr.Image(type="numpy", label="Mask", format='png', interactive=False)
                     with gr.Tab("Measure", interactive=hasattr(model, 'scale_head')):
                         gr.Markdown("### Click on the image to measure the distance between two points. \n"
                          "**Note:** Metric scale is most reliable for typical indoor or street scenes, and may degrade for contents unfamiliar to the model (e.g., stylized or close-up images).")
                         measure_image = gr.Image(type="numpy", show_label=False, format='webp', interactive=False, sources=[])
+                        gr.Markdown("Click on the image to measure the distance between two points.")
                         measure_text = gr.Markdown("")
                     with gr.Tab("Download"):
                         files = gr.File(type='filepath', label="Output Files")
-        
-        if Path('example_images').exists():
-            example_image_paths = sorted(list(itertools.chain(*[Path('example_images').glob(f'*.{ext}') for ext in ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']])))
+
+        if Path('example_images/moge3').exists():
+            example_image_paths = sorted(list(itertools.chain(*[Path('example_images/moge3').glob(f'*.{ext}') for ext in ['jpg', 'png', 'jpeg', 'JPG', 'PNG', 'JPEG']])))
             examples = gr.Examples(
                 examples = example_image_paths,
                 inputs=input_image,
@@ -279,12 +283,12 @@ f'''
             )
 
         submit_btn.click(
-            fn=lambda: [None, None, None, None, None, "", "", ""],
-            outputs=[results, depth_map, normal_map, model_3d, files, fov, viewer_message, depth_message]
+            fn=lambda: [None, None, None, None, None, None, "", "", ""],
+            outputs=[results, depth_map, normal_map, mask_map, model_3d, files, fov, viewer_message, depth_message]
         ).then(
             fn=run,
-            inputs=[input_image, max_size_input, resolution_level, apply_mask, remove_edges],
-            outputs=[results, depth_map, normal_map, model_3d, files, fov, viewer_message, depth_message]
+            inputs=[input_image, max_size_input, resolution_level, apply_mask, remove_edges, refine_steps],
+            outputs=[results, depth_map, normal_map, mask_map, model_3d, files, fov, viewer_message, depth_message]
         ).then(
             fn=reset_measure,
             inputs=[results],
@@ -297,7 +301,18 @@ f'''
             outputs=[measure_image, measure_points, measure_text]
         )
     
-    demo.launch(share=share, theme=gr.themes.Soft())
+    demo.launch(
+        share=share,
+        app_kwargs={
+            "middleware": [
+                Middleware(
+                    GZipMiddleware,
+                    minimum_size=1024,
+                    compresslevel=6,
+                )
+            ]
+        },
+    )
 
 
 if __name__ == '__main__':

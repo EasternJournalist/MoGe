@@ -181,42 +181,50 @@ Here is a minimal example for loading the model and inferring on a single image.
 import cv2
 import torch
 # from moge.model.v1 import MoGeModel
-from moge.model.v2 import MoGeModel # Let's try MoGe-2
+# from moge.model.v2 import MoGeModel
+from moge.model.v3 import MoGeModel # Let's try MoGe-3
 
 device = torch.device("cuda")
 
-# Load the model from huggingface hub (or load from local).
-model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)                             
+# Load the model
+model = MoGeModel.from_pretrained("PATH_TO_CKPT.pt").to(device)
 
 # Read the input image and convert to tensor (3, H, W) with RGB values normalized to [0, 1]
 input_image = cv2.cvtColor(cv2.imread("PATH_TO_IMAGE.jpg"), cv2.COLOR_BGR2RGB)                       
 input_image = torch.tensor(input_image / 255, dtype=torch.float32, device=device).permute(2, 0, 1)    
 
-# Infer 
+# Infer
+# Three refinement steps are applied by default. Set `refine_steps` to change this.
 output = model.infer(input_image)
 """
-`output` has keys "points", "depth", "mask", "normal" (optional) and "intrinsics",
-The maps are in the same size as the input image. 
+`output` contains the final prediction and the prediction from every refinement step.
+All maps have the same height and width as the input image.
 {
-    "points": (H, W, 3),    # point map in OpenCV camera coordinate system (x right, y down, z forward). For MoGe-2, the point map is in metric scale.
-    "depth": (H, W),        # depth map
-    "normal": (H, W, 3)     # normal map in OpenCV camera coordinate system. (available for MoGe-2-normal)
-    "mask": (H, W),         # a binary mask for valid pixels. 
-    "intrinsics": (3, 3),   # normalized camera intrinsics
+  "points": (H, W, 3),                  # final metric point map in OpenCV camera coordinates (x right, y down, z forward)
+  "points_per_step": [(H, W, 3), ...], # initial point map followed by each refined point map
+  "depth": (H, W),                      # final metric depth map
+  "depth_per_step": [(H, W), ...],     # initial depth map followed by each refined depth map
+  "intrinsics": (3, 3),                 # normalized camera intrinsics for the final prediction
+  "intrinsics_per_step": [(3, 3), ...],# camera intrinsics for the initial and refined predictions
+  "mask": (H, W),                       # binary mask for valid pixels
+  "normal": (H, W, 3),                 # normal map in OpenCV camera coordinates (optional)
 }
+The `*_per_step` lists contain `refine_steps + 1` entries, including the initial prediction.
 """
 ```
 For more usage details, see the `MoGeModel.infer()` docstring.
 
 ## 💡 Usage
 
-### Gradio demo | `moge app`
+### Gradio demo
 > The demo for MoGe-1 is available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe).
 > The demo for MoGe-2 is available at our [Hugging Face Space](https://huggingface.co/spaces/Ruicheng/MoGe-2).
 
 ```bash
 # Using the command line tool
-moge app        # will run MoGe-2 demo by default.
+moge app --version v1
+moge app --version v2
+moge app --version v3 --pretrained PATH_TO_CKPT.pt
 
 # In this repo
 python moge/scripts/app.py   # --share for Gradio public sharing
@@ -231,7 +239,10 @@ Run the script `moge/scripts/infer.py` via the following command:
 
 ```bash
 # Save the output [maps], [glb] and [ply] files
-moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --o OUTPUT_FOLDER --maps --glb --ply
+moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --version v2 --o OUTPUT_FOLDER --maps --glb --ply
+
+# MoGe-3 requires an explicit checkpoint and supports sparse refinement
+moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --version v3 --pretrained PATH_TO_CKPT.pt --refine_steps 3 --o OUTPUT_FOLDER --maps --glb --ply
 
 # Show the result in a window (requires pyglet < 2.0, e.g. pip install pyglet==1.5.29)
 moge infer -i IMAGES_FOLDER_OR_IMAGE_PATH --o OUTPUT_FOLDER --show
@@ -251,9 +262,9 @@ Options:
                               horizontal field of view in degrees. Otherwise,
                               MoGe will estimate it.
   -o, --output PATH           Output folder path
-  --pretrained TEXT           Pretrained model name or path. If not provided,
-                              the corresponding default model will be chosen.
-  --version [v1|v2]           Model version. Defaults to "v2"
+  --pretrained TEXT           Pretrained model name or path. Optional for v1/v2
+                              and required for v3.
+  --version [v1|v2|v3]        Model version. Defaults to "v3"
   --device TEXT               Device name (e.g. "cuda", "cuda:0", "cpu").
                               Defaults to "cuda"
   --fp16                      Use fp16 precision for much faster inference.
@@ -271,6 +282,9 @@ Options:
                               in the (suggested) range of `[1200, 2500]`.
                               `resolution_level` will be ignored if
                               `num_tokens` is provided. Default: None
+  --refine_steps INTEGER RANGE
+                              Number of sparse refinement steps for v3.
+                              Defaults to 3. [x>=0]
   --threshold FLOAT           Threshold for removing edges. Defaults to 0.01.
                               Smaller value removes more edges. "inf" means no
                               thresholding.
@@ -341,5 +355,15 @@ If you find our work useful in your research, we gratefully request that you con
       archivePrefix={arXiv},
       primaryClass={cs.CV},
       url={https://arxiv.org/abs/2507.02546}, 
+}
+
+@misc{kong2026finedetailmonoculargeometryestimation,
+      title={Fine-Detail Monocular Geometry Estimation with Self-Guided Sparse Volumetric Refinement},
+      author={Lingyu Kong and Ruicheng Li and Ruicheng Wang and Sicheng Xu and Chengtang Yao and Jianfeng Xiang and Jiaolong Yang},
+      year={2026},
+      eprint={2607.17967},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2607.17967},
 }
 ```

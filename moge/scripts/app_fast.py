@@ -215,9 +215,10 @@ def build_viewer_html(config: Dict[str, Any], height: str = '60vh') -> str:
 
 @click.command(help='Web demo')
 @click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', required=True, help='The name or path of the pre-trained model.')
+@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
+@click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
 @click.option('--fp16', 'use_fp16', is_flag=True, help='Whether to use fp16 inference.')
-def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
+def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
     print("Import modules...")
     # Lazy import
     import cv2
@@ -247,14 +248,15 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
     from moge.utils.tools import timeit
 
     print("Load model...")
-    # v3 not released to huggingface yet
-    # if pretrained_model_name_or_path is None:
-    #     DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION = {
-    #         "v1": "Ruicheng/moge-vitl",
-    #         "v2": "Ruicheng/moge-2-vitl-normal",
-    #     }
-    #     pretrained_model_name_or_path = DEFAULT_PRETRAINED_MODEL_FOR_EACH_VERSION['v3']
-    model = import_model_class_by_version('v3').from_pretrained(pretrained_model_name_or_path).cuda().eval()
+    if pretrained_model_name_or_path is None:
+        default_pretrained_models = {
+            'v1': 'Ruicheng/moge-vitl',
+            'v2': 'Ruicheng/moge-2-vitl-normal',
+        }
+        if model_version == 'v3':
+            raise click.UsageError('--pretrained is required when --version is v3.')
+        pretrained_model_name_or_path = default_pretrained_models[model_version]
+    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).cuda().eval()
     thread_pool_executor = ThreadPoolExecutor(max_workers=1)
     TEMP_DIR.mkdir(exist_ok=True)
 
@@ -274,7 +276,14 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
     @(spaces.GPU if HUGGINFACE_SPACES_INSTALLED else lambda x: x)
     def run_with_gpu(image: np.ndarray, resolution_level: int, apply_mask: bool, refine_steps: int) -> Dict[str, np.ndarray]:
         image_tensor = torch.tensor(image, dtype=torch.float32, device=torch.device('cuda')).permute(2, 0, 1) / 255
-        output = model.infer(image_tensor, apply_mask=apply_mask, resolution_level=resolution_level, refine_steps=refine_steps, use_fp16=use_fp16)
+        infer_kwargs = {
+            'apply_mask': apply_mask,
+            'resolution_level': resolution_level,
+            'use_fp16': use_fp16,
+        }
+        if model_version == 'v3':
+            infer_kwargs['refine_steps'] = refine_steps
+        output = model.infer(image_tensor, **infer_kwargs)
         output = {k: v.cpu().numpy() for k, v in output.items() if isinstance(v, torch.Tensor)}
         return output
 
@@ -290,7 +299,8 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
         resolution_level_int = {'Low': 0, 'Medium': 5, 'High': 9, 'Ultra': 30}.get(resolution_level, 9)
         output = run_with_gpu(image, resolution_level_int, apply_mask, refine_steps)
 
-        points, depth, mask, normal = output['points'], output['depth'], output['mask'], output['normal']
+        points, depth, mask = output['points'], output['depth'], output['mask']
+        normal = output.get('normal')
 
         if remove_edge:
             edge = utils3d.np.depth_map_edge(depth, ltol=0.02)
@@ -306,7 +316,7 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
 
         # depth & normal visualization
         depth_vis = colorize_depth(depth)
-        normal_vis = colorize_normal(normal)
+        normal_vis = colorize_normal(normal) if normal is not None else None
         mask_vis = mask_cleaned.astype(np.uint8) * 255
 
         # mesh & pointcloud
@@ -438,9 +448,12 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
             return [image, measure_points, depth_text]
         
     print("Create Gradio app...")
+    model_names = {'v1': 'MoGe-1', 'v2': 'MoGe-2', 'v3': 'MoGe-3'}
+    model_urls = {'v1': 'https://wangrc.site/MoGePage/', 'v2': 'https://wangrc.site/MoGe2Page/', 'v3': 'https://qft-333.github.io/moge3page/'}
+    model_name = model_names[model_version]
     with gr.Blocks() as demo:
         gr.Markdown(
-            f"## Turn a 2D image into a 3D point map with [MoGe3](https://qft-333.github.io/moge3page/)\n Model: {pretrained_model_name_or_path}"
+            f"## Turn a 2D image into a 3D point map with [{model_name}]({model_urls[model_version]})\n Model: {pretrained_model_name_or_path}"
         )
         results = gr.State(value=None)
         measure_points = gr.State(value=[])
@@ -450,7 +463,7 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
                 input_image = gr.Image(type="numpy", image_mode="RGB", label="Input Image")
                 with gr.Accordion(label="Settings", open=False):
                     max_size_input = gr.Number(value=1600, label="Maximum Image Size", precision=0, minimum=256, maximum=4096)
-                    refine_steps = gr.Number(value=3, label="Refine Steps", precision=0, minimum=0, maximum=5)
+                    refine_steps = gr.Number(value=3 if hasattr(model, 'refiner') else 0, label="Refine Steps", precision=0, minimum=0, maximum=5, visible=hasattr(model, 'refiner'))
                     resolution_level = gr.Dropdown(['Low', 'Medium', 'High', 'Ultra'], label="Inference Resolution Level", value='High')
                     apply_mask = gr.Checkbox(value=True, label="Apply mask")
                     remove_edges = gr.Checkbox(value=True, label="Remove edges")
@@ -465,11 +478,11 @@ def main(share: bool, pretrained_model_name_or_path: str, use_fp16: bool):
                     with gr.Tab("Depth"):
                         depth_message = gr.Markdown("")
                         depth_map = gr.Image(type="numpy", label="Colorized Depth Map", format='png', interactive=False)
-                    with gr.Tab("Normal"):
+                    with gr.Tab("Normal", visible=hasattr(model, 'normal_head')):
                         normal_map = gr.Image(type="numpy", label="Normal Map", format='png', interactive=False)
                     with gr.Tab("Mask"):
                         mask_map = gr.Image(type="numpy", label="Mask", format='png', interactive=False)
-                    with gr.Tab("Measure"):
+                    with gr.Tab("Measure", interactive=hasattr(model, 'scale_head')):
                         gr.Markdown("### Click on the image to measure the distance between two points. \n"
                          "**Note:** Metric scale is most reliable for typical indoor or street scenes, and may degrade for contents unfamiliar to the model (e.g., stylized or close-up images).")
                         measure_image = gr.Image(type="numpy", show_label=False, format='webp', interactive=False, sources=[])
