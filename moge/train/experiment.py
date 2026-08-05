@@ -1,4 +1,4 @@
-"""Run scaffolding shared by the MoGe-3 training entry points: the Accelerator,
+"""Run scaffolding shared by the MoGe training entry points: the Accelerator,
 the logging backends, and the periodic metric upload.
 """
 import json
@@ -23,10 +23,12 @@ def setup_accelerator(
     find_unused_parameters: bool,
     batch_size_forward: int,
     workspace_path: str,
+    mixed_precision: Optional[str] = None,
 ) -> Tuple[Accelerator, Any, int, Path]:
     """Build the Accelerator and derive the values every trainer needs from it."""
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters),
             InitProcessGroupKwargs(timeout=timedelta(hours=1))

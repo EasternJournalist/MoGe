@@ -1,4 +1,4 @@
-"""Checkpoint loading, saving and scheduling for the MoGe-3 training entry points."""
+"""Checkpoint loading, saving and scheduling for the MoGe training entry points."""
 import io
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -48,14 +48,15 @@ def load_checkpoint(
 
 
 def _hydrate_shards(checkpoint, i_step, workspace, accelerator, enable_ema):
-    if 'model' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{i_step:08d}.pt')).exists():
+    ckpt_name = f'{i_step:08d}' if isinstance(i_step, int) else i_step
+    if 'model' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{ckpt_name}.pt')).exists():
         print(f'Load model checkpoint: {path}')
         checkpoint['model'] = torch.load(path, map_location='cpu', weights_only=True)['model']
-    if 'optimizer' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{i_step:08d}_optimizer.pt')).exists():
+    if 'optimizer' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{ckpt_name}_optimizer.pt')).exists():
         print(f'Load optimizer checkpoint: {path}')
         checkpoint.update(torch.load(path, map_location='cpu', weights_only=True))
     if enable_ema and accelerator.is_main_process:
-        if 'ema_model' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{i_step:08d}_ema.pt')).exists():
+        if 'ema_model' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{ckpt_name}_ema.pt')).exists():
             print(f'Load EMA model checkpoint: {path}')
             checkpoint['ema_model'] = torch.load(path, map_location='cpu', weights_only=True)['model']
     return checkpoint
@@ -80,7 +81,15 @@ def restore_training_state(
         print('Initialize model weights')
         with accelerator.local_main_process_first():
             model.init_weights()
+        if enable_ema and accelerator.is_main_process:
+            ema_model.module.load_state_dict(model.state_dict())
         return 0
+
+    if 'model' not in checkpoint:
+        raise FileNotFoundError(
+            f"Checkpoint step {checkpoint.get('step', '?')} has no model state; "
+            "the checkpoint may be incomplete or the requested step may not exist"
+        )
 
     model.load_state_dict(checkpoint['model'], strict=False)
     if 'step' in checkpoint:
@@ -97,7 +106,8 @@ def restore_training_state(
         if 'ema_model' in checkpoint:
             ema_model.module.load_state_dict(checkpoint['ema_model'], strict=False)
         else:
-            print('Warning: EMA enabled but no EMA model state found in checkpoint, EMA model is re-initialized')
+            ema_model.module.load_state_dict(model.state_dict())
+            print('Warning: EMA enabled but no EMA state found; initialized EMA from the loaded model')
     if 'lr_scheduler' in checkpoint:
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
     else:
@@ -117,6 +127,49 @@ def restore_ma_buffer(workspace: Path, initial_step: int, accelerator) -> deque:
         else:
             print('Warning: No ma_buffer state found, ma1000/avg1000 metrics will restart from the beginning')
     return ma_buffer
+
+
+def restore_data_pipeline_states(
+    workspace: Path,
+    initial_step: int,
+    accelerator,
+    pipelines: Dict[str, Any],
+) -> None:
+    """Restore per-rank dataloader RNG states that match the resumed step."""
+    if initial_step <= 0:
+        return
+    expected_step = initial_step - 1
+    for name, pipeline in pipelines.items():
+        path = Path(
+            workspace, 'checkpoint', 'data_pipeline',
+            f'latest_{name}_data_pipeline_rank_{accelerator.process_index}.pt',
+        )
+        if not path.exists():
+            print(f'Warning: No {name} data pipeline state found; data ordering will restart')
+            continue
+        state = torch.load(path, map_location='cpu', weights_only=False)
+        if state.get('step') != expected_step:
+            print(
+                f"Warning: {name} data pipeline state is from step {state.get('step', '?')}, "
+                f'not requested step {expected_step}; data ordering will restart'
+            )
+            continue
+        pipeline.load_state_dict(state)
+        print(f'Restored {name} data pipeline state for rank {accelerator.process_index} from step {expected_step}')
+
+
+def save_data_pipeline_states(
+    workspace: Path,
+    i_step: int,
+    accelerator,
+    pipelines: Dict[str, Any],
+) -> None:
+    """Save each dataloader RNG state separately for every distributed rank."""
+    state_dir = Path(workspace, 'checkpoint', 'data_pipeline')
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for name, pipeline in pipelines.items():
+        path = state_dir / f'latest_{name}_data_pipeline_rank_{accelerator.process_index}.pt'
+        torch.save({'step': i_step, **pipeline.state_dict()}, path)
 
 
 class CheckpointSaver:
@@ -193,7 +246,8 @@ class CheckpointSaver:
                 'model_config': model_config,
                 'model': self.ema_model.module.state_dict(),
             }, True)
-        self._write('latest.pt', {'model_config': model_config, 'step': i_step}, async_save)
+        latest_step = 'final' if ckpt_name == 'final' else i_step
+        self._write('latest.pt', {'model_config': model_config, 'step': latest_step}, async_save)
         self._write('latest_ma_buffer.pt', {'step': i_step, 'ma_buffer': list(self.ma_buffer)}, async_save)
 
     def is_due(self, i_step: int) -> bool:
@@ -201,8 +255,17 @@ class CheckpointSaver:
         return self._classify(i_step)[0]
 
     def _classify(self, i_step: int) -> Tuple[bool, bool]:
-        is_permanent = (i_step % self.checkpoint_every == 0) and (i_step != self.initial_step)
-        is_rolling = (i_step % self.rolling_checkpoint_every == 0) and (i_step != self.initial_step) and not is_permanent
+        is_permanent = (
+            self.checkpoint_every > 0
+            and i_step % self.checkpoint_every == 0
+            and i_step != self.initial_step
+        )
+        is_rolling = (
+            self.rolling_checkpoint_every > 0
+            and i_step % self.rolling_checkpoint_every == 0
+            and i_step != self.initial_step
+            and not is_permanent
+        )
         is_final = (i_step == self.num_iterations - 1)
         return is_permanent or is_rolling or is_final, is_rolling
 

@@ -44,9 +44,15 @@ from .utils import (
     write_refine_monitor_table,
 )
 from ..utils.tools import key_average, flatten_nested_dict
-from .options import common_train_options
 from .experiment import RunLogger, setup_accelerator
-from .checkpoint import CheckpointSaver, load_checkpoint, restore_ma_buffer, restore_training_state
+from .checkpoint import (
+    CheckpointSaver,
+    load_checkpoint,
+    restore_data_pipeline_states,
+    restore_ma_buffer,
+    restore_training_state,
+    save_data_pipeline_states,
+)
 from .debug import DebugDumper
 from .visualization import visualize_gt, visualize_predictions
 from ..test.metrics import compute_metrics
@@ -57,9 +63,35 @@ torch._dynamo.config.disable = True
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
 
 @click.command()
-@common_train_options
+@click.option('--config', 'config_path', type=str, default='configs/debug.json')
+@click.option('--name', 'experiment_name', type=str, default='debug', help='Name of the experiment')
+@click.option('--workspace_path', type=str, default='./workspace/', help='Path of workspace for saving visualizations and checkpoints')
+@click.option('--base_checkpoint', type=str, default='', help='Checkpoint to fall back to when the workspace has none of its own')
+@click.option('--checkpoint', 'checkpoint_path', type=str, default='latest', help='Path to the checkpoint to load, step number, "latest", or "none"')
+@click.option('--batch_size_forward', type=int, default=1, help='Batch size for each forward pass on each device')
+@click.option('--gradient_accumulation_steps', type=int, default=2, help='Number of steps to accumulate gradients')
+@click.option('--backbone_gradient_checkpoint', type=bool, default=False, help='Use gradient checkpointing in backbone')
 @click.option('--refiner_gradient_checkpoint', type=bool, default=True, help='Use gradient checkpointing inside the sparse refiner')
 @click.option('--refiner_bf16', type=bool, default=False, help='Wrap the sparse refiner with a bf16 autocast scope (only effective when --precision mixed_bf16; default is fp32 for the refiner)')
+@click.option('--precision', type=click.Choice(['fp32', 'tf32', 'mixed_bf16']), default='fp32', help='Numerical precision to use')
+@click.option('--enable_ema', type=bool, default=True, help='Maintain an exponential moving average of the model weights')
+@click.option('--debug', 'debug_mode', type=bool, default=False, help='Enable debug mode')
+@click.option('--num_iterations', type=int, default=1000000, help='Number of iterations to train the model')
+@click.option('--checkpoint_every', type=int, default=5000, help='Save permanent checkpoint every n iterations')
+@click.option('--rolling_checkpoint_every', type=int, default=500, help='Save rolling checkpoint every n iterations (only keeps the latest)')
+@click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
+@click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
+@click.option('--vis_gt', type=bool, default=True, help='Visualize ground truth')
+@click.option('--num_vis_images', type=int, default=32, help='Number of images to visualize, must be a multiple of divided batch size')
+@click.option('--log_type', type=click.Choice(['mlflow', 'tensorboard', 'wandb']), multiple=True, default=('tensorboard',), help='log type to use (can specify multiple)')
+@click.option('--log_dir', type=str, default=None, help='Root directory for tensorboard logs')
+@click.option('--gc_every', type=int, default=1000, help='Run garbage collection every n iterations to reduce memory usage')
+@click.option('--seed', type=int, default=0, help='Random seed')
+@click.option('--wandb_project', type=str, default='MoGe', help='Weights & Biases project name')
+@click.option('--max_invalid_batches', type=int, default=-1, help='Maximum number of all-invalid batches before abort; set to -1 to disable this check')
+@click.option('--find_unused_parameters', type=bool, default=True, help='Whether to set find_unused_parameters=True for DistributedDataParallel, which may be necessary if not all model parameters receive gradients in each iteration')
+@click.option('--num_load_workers', type=int, default=4, help='Number of workers for loading data')
+@click.option('--num_process_workers', type=int, default=8, help='Number of workers for processing data')
 def main(
     config_path: str,
     experiment_name: str,
@@ -194,15 +226,8 @@ def main(
         norefine_data_pipeline = TrainDataLoaderPipeline(deepcopy(config['norefine_data']), batch_size_forward, workspace=workspace, num_load_workers=num_load_workers, num_process_workers=num_process_workers, seed=dataloader_seed)
 
     # Restore data pipeline RNG state if resuming
-    if initial_step > 0:
-        for _pipeline_name, _pipeline in [('refine', refine_data_pipeline), ('norefine', norefine_data_pipeline)]:
-            _pipeline_state_path = Path(workspace, 'checkpoint', 'data_pipeline', f'latest_{_pipeline_name}_data_pipeline_rank_{accelerator.process_index}.pt')
-            if _pipeline_state_path.exists():
-                _pipeline_state = torch.load(_pipeline_state_path, map_location='cpu', weights_only=False)
-                _pipeline.load_state_dict(_pipeline_state)
-                print(f"Restored {_pipeline_name} data pipeline state for rank {accelerator.process_index} from step {_pipeline_state.get('step', '?')}")
-            else:
-                print(f"Warning: No {_pipeline_name} data pipeline state found for rank {accelerator.process_index}, data ordering will restart from the beginning")
+    data_pipelines = {'refine': refine_data_pipeline, 'norefine': norefine_data_pipeline}
+    restore_data_pipeline_states(workspace, initial_step, accelerator, data_pipelines)
 
     records = []
     ma_buffer = restore_ma_buffer(workspace, initial_step, accelerator)
@@ -527,7 +552,7 @@ def main(
                     )
 
             # Log metrics
-            if i_step != initial_step and i_step % log_every == 0:
+            if log_every > 0 and i_step != initial_step and i_step % log_every == 0:
                 _extra_scalars = {}
                 for _log in (loss_decrease_log, delta_increase_log, error_decrease_log):
                     _extra_scalars.update(_log)
@@ -540,10 +565,7 @@ def main(
 
             # Save data pipeline RNG state for all processes so data order can be resumed
             if checkpoint_saver.is_due(i_step):
-                for _pipeline_name, _pipeline in [('refine', refine_data_pipeline), ('norefine', norefine_data_pipeline)]:
-                    _pipeline_state_path = Path(workspace, 'checkpoint', 'data_pipeline', f'latest_{_pipeline_name}_data_pipeline_rank_{accelerator.process_index}.pt')
-                    _pipeline_state_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save({'step': i_step, **_pipeline.state_dict()}, _pipeline_state_path)
+                save_data_pipeline_states(workspace, i_step, accelerator, data_pipelines)
 
             if accelerator.is_main_process and i_step > 0 and i_step % 100 == 0:
                 pbar.write(f'[Step {i_step}] refine data pipeline profile:\n{refine_data_pipeline.profile()}')
@@ -553,7 +575,7 @@ def main(
 
             if max_invalid_batches >= 0:
                 invalid_batch_abort_flag = torch.tensor(
-                    [int(invalid_batch_encountered_times >= max_invalid_batches)],
+                    [int(invalid_batch_encountered_times > max_invalid_batches)],
                     device=device,
                     dtype=torch.int32,
                 )
@@ -586,7 +608,7 @@ def main(
                         traceback.print_exc()
 
             # Garbage collection to reduce peak memory
-            if (i_step % gc_every == 0) and (i_step != initial_step):
+            if gc_every > 0 and (i_step % gc_every == 0) and (i_step != initial_step):
                 gc.collect()
                 torch.cuda.empty_cache()
 
