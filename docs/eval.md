@@ -33,6 +33,9 @@ Run the script [`moge/scripts/eval_baseline.py`](../moge/scripts/eval_baseline.p
 For example, 
 
 ```bash
+# Evaluate MoGe-3 on the 10 benchmarks with 3 refine steps
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --pretrained PATH_TO_CKPT.pt --resolution_level 9 --version v3 --refine_steps 3
+
 # Evaluate MoGe on the 10 benchmarks
 python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --pretrained Ruicheng/moge-vitl --resolution_level 9
 
