@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
   "click>=8.3.1",
   "numpy>=2",
-  "opencv-python-headless==4.10.0.84",
+  "opencv-python-headless", # ==4.10.0.84 if any issue with OpenCV
   "scipy>=1.8",
   "pillow",
   "matplotlib",
@@ -50,6 +50,9 @@ train = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["moge*"]
+
+[tool.setuptools.package-data]
+"moge.utils.gradio_3d_viewer" = ["viewer.html", "assets/*.js", "assets/LICENSE"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]

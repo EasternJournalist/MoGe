@@ -74,7 +74,7 @@ def visualize_predictions(
     with torch.inference_mode():
         for i_batch, batch in enumerate(tqdm(batches_for_vis, desc=f'Visualize: {i_step:08d}', leave=False)):
             image = batch['image'].to(device)
-            infer_kwargs = {'refine_steps': refine_steps} if refine_steps is not None else {}
+            infer_kwargs = {'refine_steps': refine_steps, 'return_per_step': True} if refine_steps is not None else {}
             output = unwrapped_model.infer(image, **infer_kwargs)
             is_refiner_output = 'points_per_step' in output or 'depth_per_step' in output
             pred_points_all = [step.cpu().numpy() for step in output.get('points_per_step', [])]

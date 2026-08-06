@@ -1,10 +1,13 @@
 from typing import *
 import itertools
+import contextlib
+import functools
 
 import torch
 import torch.nn as nn
 
 from ..utils import wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+
 
 class ResidualConvBlock(nn.Module):  
     def __init__(
@@ -115,6 +118,7 @@ class ConvStack(nn.Module):
         res_block_in_norm: Literal['layer_norm', 'group_norm' , 'instance_norm', 'none'] = 'layer_norm',
         res_block_hidden_norm: Literal['layer_norm', 'group_norm' , 'instance_norm', 'none'] = 'group_norm',
         activation: Literal['relu', 'leaky_relu', 'silu', 'elu'] = 'relu',
+        fp32_output_projection: bool = False
     ):
         super().__init__()
         self.input_blocks = nn.ModuleList([
@@ -143,6 +147,7 @@ class ConvStack(nn.Module):
             nn.Conv2d(dim_res_block_, dim_out_, kernel_size=1, stride=1, padding=0) if dim_out_ is not None else nn.Identity() 
                 for dim_out_, dim_res_block_ in zip(dim_out if isinstance(dim_out, Sequence) else itertools.repeat(dim_out), dim_res_blocks)
         ])
+        self.fp32_output_projection = fp32_output_projection
 
     def enable_gradient_checkpointing(self):
         for i in range(len(self.resamplers)):
@@ -160,7 +165,13 @@ class ConvStack(nn.Module):
             elif feature is not None:
                 x = x + feature
             x = self.res_blocks[i](x)
-            out_features.append(self.output_blocks[i](x))
+            # Optionally force the 1x1 output projection to run in fp32
+            with (
+                torch.autocast(device_type=x.device.type, dtype=torch.float32, enabled=True)
+                if self.fp32_output_projection
+                else contextlib.nullcontext()
+            ):
+                out_features.append(self.output_blocks[i](x))
             if i < len(self.res_blocks) - 1:
                 x = self.resamplers[i](x)
         return out_features

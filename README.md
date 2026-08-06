@@ -197,19 +197,17 @@ input_image = torch.tensor(input_image / 255, dtype=torch.float32, device=device
 # Three refinement steps are applied by default. Set `refine_steps` to change this.
 output = model.infer(input_image)
 """
-`output` contains the final prediction and the prediction from every refinement step.
+`output` contains the final prediction. Pass `return_per_step=True` to also return every refinement step.
 All maps have the same height and width as the input image.
 {
   "points": (H, W, 3),                  # final metric point map in OpenCV camera coordinates (x right, y down, z forward)
-  "points_per_step": [(H, W, 3), ...], # initial point map followed by each refined point map
   "depth": (H, W),                      # final metric depth map
-  "depth_per_step": [(H, W), ...],     # initial depth map followed by each refined depth map
   "intrinsics": (3, 3),                 # normalized camera intrinsics for the final prediction
-  "intrinsics_per_step": [(3, 3), ...],# camera intrinsics for the initial and refined predictions
   "mask": (H, W),                       # binary mask for valid pixels
   "normal": (H, W, 3),                 # normal map in OpenCV camera coordinates (optional)
 }
-The `*_per_step` lists contain `refine_steps + 1` entries, including the initial prediction.
+With `return_per_step=True`, `points_per_step`, `depth_per_step`, and `intrinsics_per_step`
+contain `refine_steps + 1` entries, including the initial prediction.
 """
 ```
 For more usage details, see the `MoGeModel.infer()` docstring.
@@ -227,7 +225,7 @@ moge app --version v2
 moge app --version v3 --pretrained PATH_TO_CKPT.pt
 
 # In this repo
-python moge/scripts/app.py   # --share for Gradio public sharing
+python -m moge.scripts.app  # --share for Gradio public sharing
 ```
 
 See also [`moge/scripts/app.py`](moge/scripts/app.py) 

@@ -54,10 +54,12 @@ class MoGeModel(nn.Module):
         self.neck = ConvStack(**neck)
         if points_head is not None:
             self.points_head = ConvStack(**points_head) 
+            self.points_head.fp32_output_projection = True  # Use fp32 for the final output projection for better surface reconstruction
         if mask_head is not None:
             self.mask_head = ConvStack(**mask_head)
         if normal_head is not None:
             self.normal_head = ConvStack(**normal_head)
+            self.normal_head.fp32_output_projection = True
         if scale_head is not None:
             self.scale_head = MLP(**scale_head)
 

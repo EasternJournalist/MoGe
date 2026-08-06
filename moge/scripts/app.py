@@ -5,7 +5,6 @@ from pathlib import Path
 if (_package_root := str(Path(__file__).absolute().parents[2])) not in sys.path:
     sys.path.insert(0, _package_root)
 import time
-import uuid
 import tempfile
 import itertools
 from typing import *
@@ -17,11 +16,14 @@ from starlette.middleware.gzip import GZipMiddleware
 import click
 
 
+TEMP_DIR = Path(tempfile.gettempdir(), 'moge')
+
+
 @click.command(help='Web demo')
 @click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
 @click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
 @click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
-@click.option('--fp16', 'use_fp16', is_flag=True, help='Whether to use fp16 inference.')
+@click.option('--fp16/--fp32', 'use_fp16', default=True, help='Whether to use fp16 or fp32 inference.')
 def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
     print("Import modules...")
     # Lazy import
@@ -32,15 +34,15 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
     import trimesh.visual
     from PIL import Image
     import gradio as gr
+    from moge.utils.gradio_3d_viewer import DepthMap3DViewer
     try:
         import spaces   # This is for deployment at huggingface.co/spaces
         HUGGINFACE_SPACES_INSTALLED = True
     except ImportError:
         HUGGINFACE_SPACES_INSTALLED = False
 
-    if model_version == 'v3':
-        import flex_gemm
-        flex_gemm.config.AUTOTUNE_MODE = 'never'
+    import flex_gemm
+    flex_gemm.config.AUTOTUNE_MODE = 'never'
 
     try:
         import utils3d_moge as utils3d
@@ -57,12 +59,14 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         default_pretrained_models = {
             'v1': 'Ruicheng/moge-vitl',
             'v2': 'Ruicheng/moge-2-vitl-normal',
+            'v3': 'TODO'
         }
         if model_version == 'v3':
-            raise click.UsageError('MoGe-3 checkpoints are not released to Huggingface yet. Please provide a local path to the checkpoint.')
+            raise click.UsageError('--pretrained is required when --version is v3.')
         pretrained_model_name_or_path = default_pretrained_models[model_version]
     model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).cuda().eval()
     thread_pool_executor = ThreadPoolExecutor(max_workers=1)
+    TEMP_DIR.mkdir(exist_ok=True)
 
     def delete_later(path: Union[str, os.PathLike], delay: int = 300):
         def _delete():
@@ -92,7 +96,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         return output
 
     # Full inference pipeline
-    def run(image: np.ndarray, max_size: int = 800, resolution_level: str = 'High',   apply_mask: bool = True, remove_edge: bool = True, refine_steps: int = 3, request: gr.Request = None):
+    def run(image: np.ndarray, max_size: int = 1024, resolution_level: str = 'High', apply_mask: bool = True, remove_edge: bool = True, refine_steps: int = 3, request: gr.Request = None):
         larger_size = max(image.shape[:2])
         if larger_size > max_size:
             scale = max_size / larger_size
@@ -107,7 +111,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         normal = output.get('normal')
 
         if remove_edge:
-            edge = utils3d.np.depth_map_edge(depth, ltol=0.02)
+            edge = utils3d.np.depth_map_edge(depth, ltol=0.01)
             mask_cleaned = mask & ~edge
         else:
             mask_cleaned = mask
@@ -134,9 +138,8 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         vertices = vertices * np.array([1, -1, -1], dtype=np.float32) 
         vertex_uvs = vertex_uvs * np.array([1, -1], dtype=np.float32) + np.array([0, 1], dtype=np.float32)
 
-        tempdir = Path(tempfile.gettempdir(), 'moge')
-        tempdir.mkdir(exist_ok=True)
-        output_path = Path(tempdir, request.session_hash)
+        TEMP_DIR.mkdir(exist_ok=True)
+        output_path = Path(TEMP_DIR, request.session_hash)
         shutil.rmtree(output_path, ignore_errors=True)
         output_path.mkdir(exist_ok=True, parents=True)
         trimesh.Trimesh(
@@ -181,8 +184,14 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         fov_x, fov_y = utils3d.np.intrinsics_to_fov(intrinsics)
         fov_x, fov_y = np.rad2deg([fov_x, fov_y])
 
+        viewer_html_value = point_cloud_viewer.build(
+            depth, image, intrinsics, output_path, mask=mask_cleaned,
+        )
+        for path in point_cloud_viewer.payload_paths(output_path):
+            delete_later(path)
+
         # messages
-        viewer_message = f'**Note:** Inference has been completed. It may take a few seconds to download the 3D model.'
+        viewer_message = f'**Note:** Inference has been completed. The point cloud is streamed as a depth map and unprojected in your browser.'
         if resolution_level != 'Ultra':
             depth_message = f'**Note:** Want sharper depth map? Try increasing the `maximum image size` and setting the `inference resolution level` to `Ultra` in the settings.'
         else:
@@ -193,7 +202,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             depth_vis,
             normal_vis, 
             mask_vis,
-            output_path / 'pointcloud.glb', 
+            viewer_html_value,
             [(output_path / f).as_posix() for f in files],
             f'**Horizontal FOV: {fov_x:.1f}°. Vertical FOV: {fov_y:.1f}°**',
             viewer_message,
@@ -215,7 +224,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
         depth_text = ""
         for i, p in enumerate(measure_points):
             d = results['depth'][p[1], p[0]]
-            depth_text += f"- **P{i + 1} depth: {d:.2f}m.**\n"
+            depth_text += f"**P{i + 1} depth: {d:.2f}m.** "
 
         if len(measure_points) == 2:
             point1, point2 = measure_points
@@ -223,7 +232,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             distance = np.linalg.norm(results['points'][point1[1], point1[0]] - results['points'][point2[1], point2[0]])
             measure_points = []
 
-            distance_text = f"- **Distance: {distance:.2f}m**"
+            distance_text = f"**Distance: {distance:.2f}m**"
 
             text = depth_text + distance_text
             return [image, measure_points, text]
@@ -245,7 +254,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             with gr.Column():
                 input_image = gr.Image(type="numpy", image_mode="RGB", label="Input Image")
                 with gr.Accordion(label="Settings", open=False):
-                    max_size_input = gr.Number(value=800, label="Maximum Image Size", precision=0, minimum=256, maximum=4096)
+                    max_size_input = gr.Number(value=1024, label="Maximum Image Size", precision=0, minimum=256, maximum=4096)
                     refine_steps = gr.Number(value=3 if hasattr(model, 'refiner') else 0, label="Refine Steps", precision=0, minimum=0, maximum=5, visible=hasattr(model, 'refiner'))
                     resolution_level = gr.Dropdown(['Low', 'Medium', 'High', 'Ultra'], label="Inference Resolution Level", value='High')
                     apply_mask = gr.Checkbox(value=True, label="Apply mask")
@@ -256,7 +265,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
                 with gr.Tabs():
                     with gr.Tab("3D View"):
                         viewer_message = gr.Markdown("")
-                        model_3d = gr.Model3D(display_mode="solid", label="3D Point Map", clear_color=[1.0, 1.0, 1.0, 1.0], height="60vh")
+                        point_cloud_viewer = DepthMap3DViewer()
                         fov = gr.Markdown()
                     with gr.Tab("Depth"):
                         depth_message = gr.Markdown("")
@@ -283,12 +292,12 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             )
 
         submit_btn.click(
-            fn=lambda: [None, None, None, None, None, None, "", "", ""],
-            outputs=[results, depth_map, normal_map, mask_map, model_3d, files, fov, viewer_message, depth_message]
+            fn=lambda: [None, None, None, None, "", None, "", "", ""],
+            outputs=[results, depth_map, normal_map, mask_map, point_cloud_viewer, files, fov, viewer_message, depth_message]
         ).then(
             fn=run,
             inputs=[input_image, max_size_input, resolution_level, apply_mask, remove_edges, refine_steps],
-            outputs=[results, depth_map, normal_map, mask_map, model_3d, files, fov, viewer_message, depth_message]
+            outputs=[results, depth_map, normal_map, mask_map, point_cloud_viewer, files, fov, viewer_message, depth_message]
         ).then(
             fn=reset_measure,
             inputs=[results],
@@ -303,6 +312,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
     
     demo.launch(
         share=share,
+        allowed_paths=[str(TEMP_DIR)],
         app_kwargs={
             "middleware": [
                 Middleware(

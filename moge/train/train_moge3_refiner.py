@@ -326,9 +326,9 @@ def main(
                                 num_tokens=num_tokens,
                                 refine_steps=refine_steps,
                                 refiner_detach_backbone=_detach_backbone,
-                                return_delta_z=True,
+                                return_per_step=True,
                             )
-                        pred_points_all, delta_z_all = (output.get(k, None) for k in ['points_per_step', 'delta_z_per_update'])
+                        pred_points_all = output.get('points_per_step', None)
                         pred_normal, pred_mask, pred_metric_scale = (output.get(k, None) for k in ['normal', 'mask', 'metric_scale'])
 
                         # Compute loss (per instance)
@@ -354,7 +354,7 @@ def main(
                                         with torch.no_grad():
                                             misc_dict[f'monitoring_step_{pred_step}'] = monitoring(pred_points_iter.detach())
                                         if pred_step > 0:
-                                            delta_stats = monitor_delta(delta_z_all[pred_step-1][i].detach())
+                                            delta_stats = monitor_delta(pred_points_i[pred_step - 1], pred_points_iter)
                                             refine_stat_dict[f'delta_z_step_{pred_step}_'] = delta_stats
                                         for k, v in config['loss'][label_type[i]].get('points', {}).items():
                                             if pred_step not in v['apply_steps']:

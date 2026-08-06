@@ -150,7 +150,8 @@ def monitoring(points: torch.Tensor):
         'std': points.std().detach(),
     }
 
-def monitor_delta(delta_z: torch.Tensor):
+def monitor_delta(points_before: torch.Tensor, points_after: torch.Tensor):
+    delta_z = points_after[..., 2].detach() - points_before[..., 2].detach()
     return {
         "mean": delta_z.mean().detach(),
         "std": delta_z.std().detach(),

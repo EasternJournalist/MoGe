@@ -23,9 +23,9 @@ class MoGeModel(MoGeModelV2):
         mask_head: Dict[str, Any] = None,
         normal_head: Dict[str, Any] = None,
         scale_head: Dict[str, Any] = None,
-        remap_output: Literal['linear', 'sinh', 'exp', 'sinh_exp'] = 'exp',
         num_tokens_range: List[int] = [1200, 3600],
         refiner: Optional[Dict[str, Any]] = None,
+        refiner_depth_resolution: float = 256,
         **deprecated_kwargs,
     ):
         super().__init__(
@@ -35,14 +35,14 @@ class MoGeModel(MoGeModelV2):
             mask_head=mask_head,
             normal_head=normal_head,
             scale_head=scale_head,
-            remap_output=remap_output,
+            remap_output='exp',
             num_tokens_range=num_tokens_range,
             **deprecated_kwargs,
         )
 
         if refiner is not None:
             refiner_cfg = dict(refiner)
-            self.refiner_depth_resolution: float = refiner_cfg.pop('depth_resolution', 256)
+            self.refiner_depth_resolution = refiner_depth_resolution
             self.refiner = Sparse3DUNet(**refiner_cfg)
         else:
             warnings.warn("Warning: refiner is not enabled.")
@@ -57,20 +57,14 @@ class MoGeModel(MoGeModelV2):
         if hasattr(self, 'refiner'):
             self.refiner.enable_gradient_checkpointing()
 
-    def _replace_logz(self, old_coord: torch.Tensor, new_logz: torch.Tensor) -> torch.Tensor:
-        uv = old_coord[..., :2]
-        return torch.cat([uv, new_logz.unsqueeze(-1)], dim=-1)
-
     def _voxelize(
         self,
         point_coord: torch.Tensor,
-        uv: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Size, torch.Tensor]:
         """
         Convert dense point coordinates to a sparse representation.
 
         - point_coord: [B, H, W, 3] at (x/z, y/z, logz).
-        - uv:   [H, W, 2] UV at the point-map resolution,
 
         Returns (feats, coords, shape, logz):
         - feats:  (M, 3) fp32 input features [uv, logz].
@@ -97,9 +91,10 @@ class MoGeModel(MoGeModelV2):
         i = torch.arange(height, device=device, dtype=torch.long).view(1, height, 1).expand(bsz, height, width)
         j = torch.arange(width, device=device, dtype=torch.long).view(1, 1, width).expand(bsz, height, width)
         batch = torch.arange(bsz, device=device, dtype=torch.long).view(bsz, 1, 1).expand(bsz, height, width)
-
         coords = torch.stack([batch, i, j, z_idx], dim=-1).reshape(-1, 4).to(torch.int32)
-        feats = torch.cat([uv.float().unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
+
+        uv = normalized_view_plane_uv(width=width, height=height, dtype=torch.float32, device=device)
+        feats = torch.cat([uv.unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
         shape = torch.Size([bsz, height, width, z_extent, feats.shape[-1]])
         return feats, coords, shape, logz
 
@@ -107,19 +102,13 @@ class MoGeModel(MoGeModelV2):
         self,
         point_coord: torch.Tensor,
         encoder_feature: torch.Tensor,
-        uv: torch.Tensor,
-        return_delta_z: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         bsz, height, width, _ = point_coord.shape
-        feats, coords, shape, logz = self._voxelize(point_coord, uv)
+        feats, coords, shape, logz = self._voxelize(point_coord)
         out = self.refiner(feats, coords, shape, encoder_feature)
         out_logz = out.float().squeeze(-1).reshape(bsz, height, width)
         refined_logz = logz + out_logz
-        if return_delta_z:
-            delta_z = (torch.exp(refined_logz) - torch.exp(logz)).detach()
-        else:
-            delta_z = None
-        return refined_logz, delta_z
+        return refined_logz
 
     def forward(
         self,
@@ -127,7 +116,7 @@ class MoGeModel(MoGeModelV2):
         num_tokens: Union[int, torch.LongTensor],
         refine_steps: int = 3,
         refiner_detach_backbone: bool = True,
-        return_delta_z: bool = False,
+        return_per_step: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if refine_steps > 0 and not hasattr(self, 'refiner'):
             raise ValueError("Refiner is not enabled but refine_steps > 0.")
@@ -147,13 +136,9 @@ class MoGeModel(MoGeModelV2):
         features = [features, None, None, None, None]
 
         # Concat UVs for aspect ratio input
-        uv_for_refiner: Optional[torch.Tensor] = None
         for level in range(5):
             uv = normalized_view_plane_uv(width=base_w * 2 ** level, height=base_h * 2 ** level, aspect_ratio=aspect_ratio, dtype=dtype, device=device)
-            if level == 4:
-                uv_for_refiner = uv
             uv = uv.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
-
             if features[level] is None:
                 features[level] = uv
             else:
@@ -170,54 +155,59 @@ class MoGeModel(MoGeModelV2):
         )
         metric_scale = self.scale_head(cls_token) if hasattr(self, 'scale_head') else None
 
-        # Resize
-        resize_fn = lambda x: F.interpolate(x, (img_h, img_w), mode='bilinear', align_corners=False, antialias=False)
-        normal, mask = (resize_fn(x) if x is not None else None for x in [normal, mask])
-
-        def coord_to_points(coord: torch.Tensor, hwc: bool, resize: bool) -> torch.Tensor:
-            # input is BHW3 or B3HW at (x/z, y/z, logz). Output is BHW3 at (x, y, z).
-            if hwc: # input is BHW3
-                coord = coord.permute(0, 3, 1, 2) # to B3HW
-            if resize:
-                coord = resize_fn(coord)
-            coord = coord.permute(0, 2, 3, 1) # to BHW3
-            points = self._remap_points(coord) # BHW3 at (x, y, z)
-            return points
-
-        # Process points and optionally refine them
-        points_per_step: List[torch.Tensor] = []
-        delta_z_per_update: List[torch.Tensor] = []
+        # Refine point map in factorized coordinate space
+        coord_per_step: List[torch.Tensor] = []
+        coords: Optional[torch.Tensor] = None
+        points: Optional[torch.Tensor] = None
+        points_per_step: Optional[List[torch.Tensor]] = None
         if raw_coord is not None: # raw_coord is B3HW at (x/z, y/z, logz)
-            points_per_step.append(coord_to_points(raw_coord, hwc=False, resize=True))
+            current_coord = raw_coord.permute(0, 2, 3, 1).float() # BHW3 at (x/z, y/z, logz)
+            if return_per_step:
+                coord_per_step.append(current_coord)
 
             if refine_steps > 0:
                 refiner_feature: torch.Tensor = features[0]
 
-                current_coord = raw_coord.permute(0, 2, 3, 1).float() # BHW3 at (x/z, y/z, logz)
                 for _ in range(refine_steps):
-                    coord_for_refiner = current_coord.detach()
                     feature_for_refiner = refiner_feature.detach() if refiner_detach_backbone else refiner_feature
-                    refined_logz, delta_z = self._refine_logz(
-                        coord_for_refiner, feature_for_refiner, uv_for_refiner, return_delta_z=return_delta_z,
-                    )
-                    current_coord = self._replace_logz(coord_for_refiner, refined_logz)
-                    points_per_step.append(coord_to_points(current_coord, hwc=True, resize=True))
-                    if return_delta_z:
-                        delta_z_per_update.append(delta_z)
+                    refined_logz = self._refine_logz(current_coord.detach(), feature_for_refiner)
+                    current_coord = torch.cat([current_coord[..., :2], refined_logz.unsqueeze(-1)], dim=-1)
+                    if return_per_step:
+                        coord_per_step.append(current_coord)
 
-        # Remap
+            coords = torch.stack(coord_per_step, dim=1) if return_per_step else current_coord.unsqueeze(1)
+
+        # Resize and remap outputs
+        resize = lambda x, channel_last=False: F.interpolate(
+            x.movedim(-1, -3) if channel_last else x,
+            (img_h, img_w),
+            mode='bilinear',
+            align_corners=False,
+            antialias=False,
+        ).movedim(-3, -1 if channel_last else -3)
+
+        if coords is not None:
+            num_point_steps = coords.shape[1]
+            coords = resize(coords.flatten(0, 1), channel_last=True)
+            coords = coords.unflatten(0, (batch_size, num_point_steps))
+            points_all = self._remap_points(coords)
+            points = points_all[:, -1]
+            if return_per_step:
+                points_per_step = list(points_all.unbind(dim=1))
+
         if normal is not None:
+            normal = resize(normal)
             normal = normal.permute(0, 2, 3, 1)
             normal = F.normalize(normal, dim=-1)
         if mask is not None:
+            mask = resize(mask)
             mask = mask.squeeze(1).sigmoid()
         if metric_scale is not None:
             metric_scale = metric_scale.squeeze(1).exp()
 
-        # `delta_z_per_update` has one entry fewer than `points_per_step`: entry i is the update from step i to i+1.
         return_dict = {
-            'points_per_step': points_per_step if len(points_per_step) > 0 else None,
-            'delta_z_per_update': delta_z_per_update if len(delta_z_per_update) > 0 else None,
+            'points': points,
+            'points_per_step': points_per_step,
             'normal': normal,
             'mask': mask,
             'metric_scale': metric_scale,
@@ -236,6 +226,7 @@ class MoGeModel(MoGeModelV2):
         apply_mask: bool = True,
         fov_x: Optional[Union[Number, torch.Tensor]] = None,
         refine_steps: int = 3,
+        return_per_step: bool = False,
         use_fp16: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -247,18 +238,19 @@ class MoGeModel(MoGeModelV2):
         - `resolution_level`: inference resolution level from 0 to 9. Higher values use more tokens and preserve finer details. Default: 9.
         - `force_projection`: if True, recompute each point map from its depth map and intrinsics. Default: True.
         - `apply_mask`: if True, mask invalid points and depths using the predicted mask. Default: True.
-        - `fov_x`: horizontal camera field of view in degrees. If None, it is inferred independently for each refinement step. Default: None.
-        - `refine_steps`: number of sparse 3D refinement updates. The output lists contain `refine_steps + 1` entries, including the initial prediction. Default: 3.
+        - `fov_x`: horizontal camera field of view in degrees. If None, it is inferred from each returned point map. Default: None.
+        - `refine_steps`: number of sparse 3D refinement updates. Default: 3.
+        - `return_per_step`: if True, return predictions for the initial estimate and every refinement step. Default: False.
         - `use_fp16`: if True, use mixed precision to speed up inference. Default: False.
 
         ### Returns
         A dictionary containing the following keys when the corresponding outputs are available:
         - `points`: final camera-space point map of shape (B, H, W, 3) or (H, W, 3).
-        - `points_per_step`: point maps for the initial prediction and every refinement step.
+        - `points_per_step`: point maps for the initial prediction and every refinement step, when `return_per_step=True`.
         - `intrinsics`: camera intrinsics associated with the final point map, of shape (B, 3, 3) or (3, 3).
-        - `intrinsics_per_step`: camera intrinsics for the initial prediction and every refinement step.
+        - `intrinsics_per_step`: camera intrinsics for the initial prediction and every refinement step, when `return_per_step=True`.
         - `depth`: final depth map of shape (B, H, W) or (H, W).
-        - `depth_per_step`: depth maps for the initial prediction and every refinement step.
+        - `depth_per_step`: depth maps for the initial prediction and every refinement step, when `return_per_step=True`.
         - `mask`: predicted valid-pixel mask of shape (B, H, W) or (H, W).
         - `normal`: predicted normal map of shape (B, H, W, 3) or (H, W, 3).
         """
@@ -282,10 +274,13 @@ class MoGeModel(MoGeModelV2):
 
         # Forward pass
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_fp16 and self.dtype != torch.float16):
-            output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps)
-        affine_points_per_step, normal, mask, metric_scale = (output.get(k, None) for k in ['points_per_step', 'normal', 'mask', 'metric_scale'])
+            output = self.forward(image, num_tokens=num_tokens, refine_steps=refine_steps, return_per_step=return_per_step)
+        affine_points, normal, mask, metric_scale = (output.get(k, None) for k in ['points', 'normal', 'mask', 'metric_scale'])
+        affine_points_per_step = output.get('points_per_step', None)
 
         # Always process the output in fp32 precision
+        if affine_points_per_step is None:
+            affine_points_per_step = [affine_points] if affine_points is not None else None
         affine_points_per_step = [p.float() for p in affine_points_per_step] if affine_points_per_step is not None else None
         normal, mask, metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [normal, mask, metric_scale, fov_x])
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):
@@ -296,7 +291,7 @@ class MoGeModel(MoGeModelV2):
 
             if affine_points_per_step is not None:
                 # Per-step (focal, shift) recovery: refinement modifies logz which changes
-                # the 3D shape, so focal recovered from each step's point map differs.
+                # the 3D shape, so focal recovered from each step's point map differs slightly
                 # Jointly solving (focal, shift) on the same point map gives the optimal
                 # affine->camera alignment for that step (matches v2_4's single-step logic).
                 if fov_x is not None:
@@ -360,15 +355,20 @@ class MoGeModel(MoGeModelV2):
                 if mask_binary is not None and normal is not None:
                     normal = torch.where(mask_binary[..., None], normal, torch.zeros_like(normal))
 
+            if not return_per_step:
+                points_per_step = None
+                depth_per_step = None
+                intrinsics_per_step = None
+
         return_dict = {
             'points': points,
-            'points_per_step': points_per_step,
             'intrinsics': intrinsics,
-            'intrinsics_per_step': intrinsics_per_step,
             'depth': depth,
-            'depth_per_step': depth_per_step,
             'mask': mask_binary,
             'normal': normal,
+            'points_per_step': points_per_step,
+            'intrinsics_per_step': intrinsics_per_step,
+            'depth_per_step': depth_per_step,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
 
