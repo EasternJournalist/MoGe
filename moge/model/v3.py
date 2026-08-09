@@ -79,10 +79,11 @@ class MoGeModel(MoGeModelV2):
         if point_coord.ndim != 4 or point_coord.shape[-1] != 3:
             raise ValueError(f"point_coord must be [B, H, W, 3], got {point_coord.shape}")
 
+        point_coord = point_coord.float()
         bsz, height, width, _ = point_coord.shape
         device = point_coord.device
 
-        logz = point_coord[..., 2].float()
+        logz = point_coord[..., 2]
         zq = torch.round(logz * self.refiner_depth_resolution).long()
         z_offset = zq.amin(dim=(1, 2), keepdim=True)
         z_idx = zq - z_offset
@@ -93,8 +94,7 @@ class MoGeModel(MoGeModelV2):
         batch = torch.arange(bsz, device=device, dtype=torch.long).view(bsz, 1, 1).expand(bsz, height, width)
         coords = torch.stack([batch, i, j, z_idx], dim=-1).reshape(-1, 4).to(torch.int32)
 
-        uv = normalized_view_plane_uv(width=width, height=height, dtype=torch.float32, device=device)
-        feats = torch.cat([uv.unsqueeze(0).expand(bsz, -1, -1, -1), logz.unsqueeze(-1)], dim=-1).reshape(-1, 3)
+        feats = point_coord.reshape(-1, 3)
         shape = torch.Size([bsz, height, width, z_extent, feats.shape[-1]])
         return feats, coords, shape, logz
 
@@ -105,7 +105,7 @@ class MoGeModel(MoGeModelV2):
     ) -> torch.Tensor:
         bsz, height, width, _ = point_coord.shape
         feats, coords, shape, logz = self._voxelize(point_coord)
-        out = self.refiner(feats, coords, shape, encoder_feature)
+        out: torch.Tensor = self.refiner(feats, coords, shape, encoder_feature)
         out_logz = out.float().squeeze(-1).reshape(bsz, height, width)
         refined_logz = logz + out_logz
         return refined_logz
