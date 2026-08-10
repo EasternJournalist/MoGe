@@ -165,7 +165,6 @@
                 1
             ]
         },
-        "remap_output": "exp",
         "num_tokens_range": [
             1200,
             3600
@@ -184,7 +183,6 @@
             "encoder_blocks_per_level": 1,
             "decoder_blocks_per_level": 1,
             "bottleneck_blocks": 1,
-            "depth_resolution": 256,
             "downsample_factors": [
                 2,
                 2,
@@ -192,7 +190,8 @@
                 2
             ],
             "encoder_downsample": 16
-        }
+        },
+        "refiner_depth_resolution": 256
     },
     "optimizer": {
         "params": [
@@ -616,7 +615,7 @@
                 "depth": "depth_completed.png"
             },
             {
-                "name": "MegaDepthRuichengV2",
+                "name": "MegaDepthAnnotated",
                 "path": "path/to/MegaDepth_260528/",
                 "label_type": "C",
                 "weight": 5.6,

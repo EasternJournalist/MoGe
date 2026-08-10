@@ -23,12 +23,10 @@ def setup_accelerator(
     find_unused_parameters: bool,
     batch_size_forward: int,
     workspace_path: str,
-    mixed_precision: Optional[str] = None,
 ) -> Tuple[Accelerator, Any, int, Path]:
     """Build the Accelerator and derive the values every trainer needs from it."""
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
-        mixed_precision=mixed_precision,
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters),
             InitProcessGroupKwargs(timeout=timedelta(hours=1))
@@ -63,7 +61,7 @@ class RunLogger:
         workspace: Path,
         config: Dict[str, Any],
         experiment_name: str,
-        log_dir: Optional[str],
+        tb_log_root: Optional[str],
         wandb_project: str,
         batch_size_total: int,
         extra_params: Optional[Dict[str, Any]] = None,
@@ -95,7 +93,7 @@ class RunLogger:
         if 'tensorboard' in self.log_type:
             try:
                 from torch.utils.tensorboard import SummaryWriter
-                self.tb_writer = SummaryWriter(log_dir=Path(log_dir or './tensorboard/', experiment_name))
+                self.tb_writer = SummaryWriter(log_dir=Path(tb_log_root or './tensorboard/', experiment_name))
                 self.tb_writer.add_text('params', json.dumps(experiment_params, indent=4))
                 self.tb_writer.flush()
             except Exception:

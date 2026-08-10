@@ -28,51 +28,74 @@ from ..utils.data_augmentation import sample_perspective, warp_perspective, imag
 from ..utils.tools import catch_exception
 
 
-class _SlotBatch(pipeline.Batch):
-    """Like ``pipeline.Batch`` but groups items into per-key buckets.
+_NO_BUCKET = object()
 
-    Each item is bucketed by ``key_fn(item)``; a bucket is emitted as a batch
-    once it reaches ``batch_size``. This lets us apply ``Filter`` upstream and
-    still produce shape-consistent batches when the pre-filter sample size
-    (e.g. target ``(height, width)``) varies across items.
+
+class _SourceBatchGroup(pipeline.Batch):
+    """Regroup surviving instances back into the source batch they came from.
+
+    ``_sample_batch`` emits fixed-size batches whose instances share one target
+    ``(height, width)``; the upstream ``Filter`` may then drop some of them as
+    invalid. Since the ``Parallel`` nodes in between are FIFO, every instance of
+    a source batch arrives contiguously, so only one bucket is ever open: a new
+    ``batch_id`` means the previous source batch is complete.
+
+    Incomplete buckets are dropped. That matches what the trainer effectively
+    saw before this was keyed by source batch -- a short bucket was keyed by
+    ``(height, width)``, which is derived from two continuous random draws and
+    so practically never recurred, meaning the bucket could never be completed
+    and was retained forever. The behaviour is the same; the unbounded
+    retention is not. To train on the survivors instead of dropping them, put
+    the bucket to the output in ``_discard_incomplete`` below.
     """
-    def __init__(self, batch_size: int, key_fn: Callable[[Any], Any], name: Optional[str] = None):
+    def __init__(self, batch_size: int, name: Optional[str] = None):
         super().__init__(batch_size=batch_size, patience=None, name=name)
-        self.key_fn = key_fn
+        self.num_incomplete_batches = 0
+        self.num_dropped_instances = 0
+
+    def _discard_incomplete(self, bucket: list):
+        if bucket:
+            self.num_incomplete_batches += 1
+            self.num_dropped_instances += len(bucket)
 
     def loop(self):
         from pipeline.components import EndOfInput, ExceptionInNode
         from pipeline.queue import ShutDown
-        buckets: Dict[Any, list] = {}
+        bucket: list = []
+        bucket_id = _NO_BUCKET
         try:
             while True:
                 item = self.input.get()
                 if isinstance(item, (EndOfInput, ExceptionInNode)):
-                    # Flush any partial buckets so nothing gets stuck on shutdown.
-                    for bucket in buckets.values():
-                        if bucket:
-                            self.output.put(bucket)
-                    buckets.clear()
+                    # A full bucket is emitted as soon as it fills, so anything
+                    # still open here is necessarily incomplete.
+                    self._discard_incomplete(bucket)
+                    bucket, bucket_id = [], _NO_BUCKET
                     self.output.put(item)
                     continue
-                key = self.key_fn(item)
-                bucket = buckets.setdefault(key, [])
+                item_id = item.get('batch_id', _NO_BUCKET)
+                if item_id != bucket_id:
+                    self._discard_incomplete(bucket)
+                    bucket, bucket_id = [], item_id
                 bucket.append(item)
                 if len(bucket) >= self.batch_size:
                     self.output.put(bucket)
-                    buckets[key] = []
+                    bucket, bucket_id = [], _NO_BUCKET
         except ShutDown:
             return
 
     def _default_name(self):
-        return f"SlotBatch(size={self.batch_size})"
+        return f"SourceBatchGroup(size={self.batch_size})"
 
 
 class TrainDataLoaderPipeline:
-    def __init__(self, config: dict, batch_size: int, num_load_workers: int = 4, num_process_workers: int = 8, buffer_size: int = 8, workspace: Path = None, filter_invalid: bool = True, seed: Optional[int] = None):
+    def __init__(self, config: dict, batch_size: int, buffer_size: int = 8, workspace: Path = None, seed: Optional[int] = None):
         self.config = config
         self.workspace = workspace
         self._rng = random.Random(seed)
+
+        num_load_workers = int(os.environ.get('MOGE_NUM_LOAD_WORKERS', 4))
+        num_process_workers = int(os.environ.get('MOGE_NUM_PROCESS_WORKERS', 8))
 
         self.batch_size = batch_size
         self.clamp_max_depth = config['clamp_max_depth']
@@ -116,29 +139,19 @@ class TrainDataLoaderPipeline:
         self.dataset_sample_count = {name: 0 for name in self.dataset_names}
 
         # Build pipeline
-        if filter_invalid:
-            # Per-bucket batching keyed by target (h, w) so that ``Filter``
-            # dropping invalid instances does not lead to mixed-size batches.
-            self.pipeline = pipeline.Sequential([
-                self._sample_batch,
-                pipeline.Unbatch(),
-                pipeline.Parallel([self._load_instance] * num_load_workers),
-                pipeline.Parallel([self._process_instance] * num_process_workers),
-                pipeline.Filter(lambda instance: instance['label_type'] != 'invalid'),
-                _SlotBatch(self.batch_size, key_fn=lambda inst: (int(inst['height']), int(inst['width']))),
-                self._collate_batch,
-                pipeline.Buffer(buffer_size),
-            ])
-        else:
-            self.pipeline = pipeline.Sequential([
-                self._sample_batch,
-                pipeline.Unbatch(),
-                pipeline.Parallel([self._load_instance] * num_load_workers),
-                pipeline.Parallel([self._process_instance] * num_process_workers),
-                pipeline.Batch(self.batch_size),
-                self._collate_batch,
-                pipeline.Buffer(buffer_size),
-            ])
+        # Regroup by source batch so that ``Filter`` dropping invalid
+        # instances does not lead to mixed-size batches.
+        self._batch_grouper = _SourceBatchGroup(self.batch_size)
+        self.pipeline = pipeline.Sequential([
+            self._sample_batch,
+            pipeline.Unbatch(),
+            pipeline.Parallel([self._load_instance] * num_load_workers),
+            pipeline.Parallel([self._process_instance] * num_process_workers),
+            pipeline.Filter(lambda instance: instance['label_type'] != 'invalid'),
+            self._batch_grouper,
+            self._collate_batch,
+            pipeline.Buffer(buffer_size),
+        ])
 
     def state_dict(self) -> dict:
         """Return the RNG state so training can resume with the same data order."""
@@ -449,7 +462,14 @@ class TrainDataLoaderPipeline:
         return self.pipeline.get()
 
     def profile(self) -> str:
-        return self.pipeline.profile()
+        text = self.pipeline.profile()
+        grouper = getattr(self, '_batch_grouper', None)
+        if grouper is not None and grouper.num_incomplete_batches > 0:
+            text += (
+                f'\nDropped {grouper.num_incomplete_batches} incomplete batches '
+                f'({grouper.num_dropped_instances} instances) whose siblings were invalid'
+            )
+        return text
 
     def start(self):
         self.pipeline.start()

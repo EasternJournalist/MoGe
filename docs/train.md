@@ -97,10 +97,9 @@ Here is a commented configuration for reference:
         "last_conv_size": 1
     },
     "optimizer": {                          # Reflection-like optimizer configurations. See moge.train.utils.py build_optimizer() for details.
-        "type": "AdamW",
-        "params": [
-            {"params": {"include": ["*"], "exclude": ["*backbone.*"]}, "lr": 1e-4},
-            {"params": {"include": ["*backbone.*"]}, "lr": 1e-5}
+        "params": [                         # One entry per parameter group. "name" is only used for logging.
+            {"name": "head", "type": "AdamW", "params": {"include": ["*"], "exclude": ["*backbone.*"]}, "lr": 1e-4},
+            {"name": "backbone", "type": "AdamW", "params": {"include": ["*backbone.*"]}, "lr": 1e-5}
         ]
     },
     "lr_scheduler": {                       # Reflection-like lr_scheduler configurations. See moge.train.utils.py build_lr_scheduler() for details.
@@ -114,26 +113,38 @@ Here is a commented configuration for reference:
         }
     },
     "low_resolution_training_steps": 50000, # Total number of low-resolution training steps. It makes the early stage training faster. Later stage training on varying size images will be slower.
-    "loss": {
+    "loss": {                               # Losses are keyed by label type, then grouped by the prediction they supervise
         "invalid": {},                      # invalid instance due to runtime error when loading data
         "synthetic": {                      # Below are loss hyperparameters
-            "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
-            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
-            "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}},
-            "patch_64": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 64, "align_resolution": 4, "num_patches": 4096}},
-            "normal": {"function": "normal_loss", "weight": 1.0},
-            "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            "points": {                     # Terms supervising the predicted point map
+                "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
+                "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
+                "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}},
+                "patch_64": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 64, "align_resolution": 4, "num_patches": 4096}},
+                "normal": {"function": "normal_loss", "weight": 1.0}
+            },
+            "mask": {                       # Terms supervising the predicted infinity mask
+                "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            }
         },
         "sfm": {
-            "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
-            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
-            "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}},
-            "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            "points": {
+                "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
+                "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
+                "patch_16": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 16, "align_resolution": 8, "num_patches": 256}}
+            },
+            "mask": {
+                "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            }
         },
         "lidar": {
-            "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
-            "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}},
-            "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            "points": {
+                "global": {"function": "affine_invariant_global_loss", "weight": 1.0, "params": {"align_resolution": 32}},
+                "patch_4": {"function": "affine_invariant_local_loss", "weight": 1.0, "params": {"level": 4, "align_resolution": 16, "num_patches": 16}}
+            },
+            "mask": {
+                "mask": {"function": "mask_l2_loss", "weight": 1.0}
+            }
         }
     }
 }
@@ -144,23 +155,27 @@ Here is a commented configuration for reference:
 Launch the training script [`moge/train/train_moge12.py`](../moge/train/train_moge12.py) as a module from the repository root. It trains both MoGe-1 and MoGe-2; which one you get is decided by `model_version` in the config. Note that we use [`accelerate`](https://github.com/huggingface/accelerate) for distributed training. 
 
 ```bash
-accelerate launch \
+uv run accelerate launch \
     --num_processes 8 \
     --module moge.train.train_moge12 \
-    --config configs/train/v1.json \
-    --workspace workspace/debug \
-    --gradient_accumulation_steps 2 \
+    --config configs/train/v2.json \
+    --name train_moge2 \
+    --workspace workspace/moge2 \
     --batch_size_forward 2 \
-    --checkpoint latest \
+    --gradient_accumulation_steps 2 \
     --enable_gradient_checkpointing True \
-    --vis_every 1000 \
-    --enable_mlflow True
+    --precision mixed_bf16 \
+    --enable_ema True \
+    --log_every 100 \
+    --log_type tensorboard \
+    --log_type wandb \
+    --vis_every 1000 
 ```
 
 
 ## Finetuning
 
-To finetune the pre-trained MoGe model, download the model checkpoint and put it in a local directory, e.g. `pretrained/moge-vitl.pt`.
+To finetune the pre-trained MoGe model, first download the model checkpoint and put it in a local directory, e.g. `pretrained/moge-vitl.pt`, then pass that checkpoint with `--initial_checkpoint`.
 
 > NOTE: when finetuning pretrained MoGe model, a much lower learning rate is required. 
 The suggested learning rate for finetuning is not greater than 1e-5 for the head and 1e-6 for the backbone. 
@@ -168,42 +183,48 @@ And the batch size is recommended to be 32 at least.
 The settings in default configuration are not optimal for specific datasets and may require further tuning.
 
 ```bash
-accelerate launch \
+uv run accelerate launch \
     --num_processes 8 \
     --module moge.train.train_moge12 \
-    --config configs/train/v1.json \
-    --workspace workspace/debug \
-    --gradient_accumulation_steps 2 \
+    --config configs/train/v2.json \
+    --name finetune_moge2 \
+    --workspace workspace/finetune_moge2 \
     --batch_size_forward 2 \
-    --checkpoint pretrained/moge-vitl.pt \
+    --gradient_accumulation_steps 2 \
+    --initial_checkpoint pretrained/moge-2-vitl.pt \
     --enable_gradient_checkpointing True \
-    --vis_every 1000 \
-    --enable_mlflow True
+    --precision mixed_bf16 \
+    --log_every 100 \
+    --log_type tensorboard \
+    --log_type wandb \
+    --vis_every 1000 
 ```
 
 
 ## Training MoGe-3
 
 MoGe-3 is trained upon a pretrained MoGe-2 checkpoint. 
-Pass that checkpoint with `--base_checkpoint`: it is used only when the workspace has no checkpoint of its own, so `--checkpoint latest` still resumes an interrupted run.
 
 ```bash
-accelerate launch \
+uv run accelerate launch \
     --num_processes 8 \
-    --module moge.train.train_moge3_refiner \
-    --config configs/train/v3_refiner.json \
-    --name my_refiner_run \
-    --workspace_path workspace/my_refiner_run \
-    --base_checkpoint workspace/moge2_ckpt.pt \
+    --module moge.train.train_moge3 \
+    --config configs/train/v3.json \
+    --name train_moge3 \
+    --workspace workspace/moge3 \
+    --initial_checkpoint pretrained/moge-2-vitl.pt \
     --checkpoint latest \
     --batch_size_forward 1 \
     --gradient_accumulation_steps 6 \
     --precision mixed_bf16 \
-    --refiner_gradient_checkpoint True \
-    --vis_every 1000
+    --enable_gradient_checkpointing True \
+    --log_every 100 \
+    --log_type tensorboard \
+    --log_type wandb \
+    --vis_every 1000 
 ```
 
-The refiner config carries a few extra keys:
+The MoGe-3 training config carries a few extra keys:
 
 | Key | Meaning |
 | --- | --- |
@@ -211,5 +232,6 @@ The refiner config carries a few extra keys:
 | `refine_ratio` | Fraction of accumulation micro-batches drawn from `refine_data` rather than `norefine_data` |
 | `refiner_detach_backbone_until` | Step until which the refiner trains on detached encoder features |
 
-Losses are configured per label type and per refine step; each term lists the `apply_steps` it contributes to. 
-Datasets used only for refinement carry label `D` in the shipped config.
+It also splits the dataset list into two pipelines, `norefine_data` and `refine_data`, instead of the single `data` key used by v1/v2. Both take the same fields as `data` above.
+
+Its `loss` section follows the same label type → group → term layout, with one addition: every term in the `points` group lists the refiner iterations it applies to via `apply_steps` (`[0]` = the base prediction only, `[0, 1, 2, 3]` = base plus all three refine steps). Datasets used only for refinement carry label `D` in the shipped config.

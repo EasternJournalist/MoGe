@@ -58,7 +58,10 @@ def _hydrate_shards(checkpoint, i_step, workspace, accelerator, enable_ema):
     if enable_ema and accelerator.is_main_process:
         if 'ema_model' not in checkpoint and (path := Path(workspace, 'checkpoint', f'{ckpt_name}_ema.pt')).exists():
             print(f'Load EMA model checkpoint: {path}')
-            checkpoint['ema_model'] = torch.load(path, map_location='cpu', weights_only=True)['model']
+            ema_checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+            checkpoint['ema_model'] = ema_checkpoint['model']
+            if 'ema_n_averaged' in ema_checkpoint:
+                checkpoint['ema_n_averaged'] = ema_checkpoint['ema_n_averaged']
     return checkpoint
 
 
@@ -73,8 +76,13 @@ def restore_training_state(
 ) -> int:
     """Apply a checkpoint to the training state, or initialise from scratch.
 
-    `strict=False` is load-bearing: a base checkpoint from a non-refiner run has
-    no `refiner.*` keys, and the refiner must keep its fresh initialisation.
+    Weights are always initialised first and the checkpoint is then loaded on top,
+    so any module the checkpoint does not carry keeps a proper initialisation.
+    `strict=False` is load-bearing for that: a base checkpoint from a non-refiner
+    run has no `refiner.*` keys, and the refiner relies on `init_weights()` zeroing
+    its output projection so its residual starts as an exact identity. Merely
+    leaving it at its constructor initialisation makes the first refine steps a
+    random perturbation of the base prediction.
     Returns the step to resume from.
     """
     if checkpoint is None:
@@ -91,6 +99,9 @@ def restore_training_state(
             "the checkpoint may be incomplete or the requested step may not exist"
         )
 
+    print('Initialize model weights before loading checkpoint')
+    with accelerator.local_main_process_first():
+        model.init_weights()
     model.load_state_dict(checkpoint['model'], strict=False)
     if 'step' in checkpoint:
         initial_step = checkpoint['step'] + 1
@@ -105,8 +116,19 @@ def restore_training_state(
     if enable_ema and accelerator.is_main_process:
         if 'ema_model' in checkpoint:
             ema_model.module.load_state_dict(checkpoint['ema_model'], strict=False)
+            # Restoring `n_averaged` is what keeps the average alive: at 0, torch's
+            # `update_parameters()` overwrites every EMA parameter with the live model.
+            # Checkpoints written before this key existed fall back to 1 rather than 0,
+            # which preserves the restored weights (the exact count only matters to
+            # `avg_fn`, and the configured one ignores it).
+            n_averaged = checkpoint.get('ema_n_averaged')
+            if n_averaged is None:
+                n_averaged = 1
+                print('Warning: EMA checkpoint has no n_averaged (written before this was tracked); assuming 1')
+            ema_model.n_averaged.fill_(int(n_averaged))
         else:
             ema_model.module.load_state_dict(model.state_dict())
+            ema_model.n_averaged.zero_()
             print('Warning: EMA enabled but no EMA state found; initialized EMA from the loaded model')
     if 'lr_scheduler' in checkpoint:
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -241,11 +263,16 @@ class CheckpointSaver:
             'lr_scheduler': self.lr_scheduler.state_dict(),
         }, async_save)
         if self.enable_ema:
-            # NOTE: always async, matching the original behaviour.
+            # `n_averaged` lives on the AveragedModel wrapper, not on `.module`, so it must be
+            # saved alongside the weights. Without it, a resumed run restores `n_averaged == 0`
+            # and torch's first `update_parameters()` hard-copies the live model over the EMA,
+            # silently discarding the average. Kept as a sibling key so `model` stays a bare
+            # state_dict that moge.model.v1/v2 `from_pretrained` can load directly.
             self._write(f'{ckpt_name}_ema.pt', {
                 'model_config': model_config,
                 'model': self.ema_model.module.state_dict(),
-            }, True)
+                'ema_n_averaged': int(self.ema_model.n_averaged),
+            }, async_save)
         latest_step = 'final' if ckpt_name == 'final' else i_step
         self._write('latest.pt', {'model_config': model_config, 'step': latest_step}, async_save)
         self._write('latest_ma_buffer.pt', {'step': i_step, 'ma_buffer': list(self.ma_buffer)}, async_save)
@@ -280,27 +307,3 @@ class CheckpointSaver:
                 record_rolling_ckpt(self.workspace, i_step)
                 self.executor.submit(cleanup_old_rolling_ckpts, self.workspace, i_step)
         return due
-
-    def poll_on_demand(self, i_step: int):
-        """Honour an out-of-band request to checkpoint at specific steps.
-
-        Reads `<workspace>/save_ckpt_at.txt`, a whitespace-separated list of step
-        numbers, and rewrites it with the steps still in the future.
-        """
-        if not (self.accelerator.is_main_process and i_step % 100 == 0):
-            return
-        path = Path(self.workspace, 'save_ckpt_at.txt')
-        if not path.exists():
-            return
-        try:
-            steps = {int(s) for s in path.read_text().split() if s.strip().isdigit()}
-            if i_step in steps:
-                self.pbar.write(f'On-demand checkpoint triggered at step {i_step}')
-                self.save(i_step)
-            remaining = {s for s in steps if s > i_step}
-            if remaining:
-                path.write_text(' '.join(str(s) for s in sorted(remaining)) + '\n')
-            else:
-                path.unlink()
-        except Exception as e:
-            self.pbar.write(f'Error reading on-demand checkpoint file: {e}')

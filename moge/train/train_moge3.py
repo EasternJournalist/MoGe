@@ -1,36 +1,49 @@
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-from pathlib import Path
+from typing import *
+
+import gc
 import json
 import math
 import random
-from typing import *
-from concurrent.futures import ThreadPoolExecutor
-import io
-import gc
-import traceback
-from collections import deque
-from datetime import timedelta
-import numpy as np
-import cv2
+import warnings
+import click
 import torch
 import torch.version
-import accelerate
-from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
-from accelerate.utils import set_seed
+
 try:
     import utils3d_moge as utils3d
 except ImportError:
     import utils3d
-import click
-from tqdm import tqdm
-from copy import deepcopy
-import shutil
-import warnings
 
-from ..utils.tools import timeit
-from moge.train.dataloader import TrainDataLoaderPipeline
-from moge.train.losses import *
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+from accelerate.utils import set_seed
+
+from .dataloader import TrainDataLoaderPipeline
+from .losses import (
+    affine_invariant_global_loss,
+    radial_partition_local_loss,
+    radial_partition_local_loss_rand_partition,
+    edge_loss,
+    normal_map_loss,
+    mask_bce_loss,
+    metric_scale_loss,
+    monitoring,
+    monitor_delta,
+    RadialPartitionLocalLossCache,
+)
+from .checkpoint import (
+    CheckpointSaver,
+    load_checkpoint,
+    restore_data_pipeline_states,
+    restore_ma_buffer,
+    restore_training_state,
+    save_data_pipeline_states,
+)
+from .debug import DebugDumper
+from .experiment import RunLogger, setup_accelerator
 from .utils import (
     accumulate_step_transitions,
     build_optimizer,
@@ -43,66 +56,65 @@ from .utils import (
     write_optimizer_param_assignment_log,
     write_refine_monitor_table,
 )
-from ..utils.tools import key_average, flatten_nested_dict
-from .experiment import RunLogger, setup_accelerator
-from .checkpoint import (
-    CheckpointSaver,
-    load_checkpoint,
-    restore_data_pipeline_states,
-    restore_ma_buffer,
-    restore_training_state,
-    save_data_pipeline_states,
-)
-from .debug import DebugDumper
 from .visualization import visualize_gt, visualize_predictions
-from ..test.metrics import compute_metrics
+from ..utils.tools import key_average, flatten_nested_dict, timeit
 
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.utils.checkpoint")
 torch._dynamo.config.disable = True
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
 
+
+def get_refine_accumulation_schedule(
+    step: int,
+    gradient_accumulation_steps: int,
+    refine_ratio: float,
+) -> List[bool]:
+    start_quota = math.floor(step * gradient_accumulation_steps * refine_ratio + 1e-9)
+    end_quota = math.floor((step + 1) * gradient_accumulation_steps * refine_ratio + 1e-9)
+    num_refine_accumulations = end_quota - start_quota
+    if num_refine_accumulations <= 0:
+        return [False] * gradient_accumulation_steps
+    if num_refine_accumulations >= gradient_accumulation_steps:
+        return [True] * gradient_accumulation_steps
+    num_norefine_accumulations = gradient_accumulation_steps - num_refine_accumulations
+    return [i >= num_norefine_accumulations for i in range(gradient_accumulation_steps)]
+
+
 @click.command()
-@click.option('--config', 'config_path', type=str, default='configs/debug.json')
-@click.option('--name', 'experiment_name', type=str, default='debug', help='Name of the experiment')
-@click.option('--workspace_path', type=str, default='./workspace/', help='Path of workspace for saving visualizations and checkpoints')
-@click.option('--base_checkpoint', type=str, default='', help='Checkpoint to fall back to when the workspace has none of its own')
-@click.option('--checkpoint', 'checkpoint_path', type=str, default='latest', help='Path to the checkpoint to load, step number, "latest", or "none"')
-@click.option('--batch_size_forward', type=int, default=1, help='Batch size for each forward pass on each device')
-@click.option('--gradient_accumulation_steps', type=int, default=2, help='Number of steps to accumulate gradients')
-@click.option('--backbone_gradient_checkpoint', type=bool, default=False, help='Use gradient checkpointing in backbone')
-@click.option('--refiner_gradient_checkpoint', type=bool, default=True, help='Use gradient checkpointing inside the sparse refiner')
-@click.option('--refiner_bf16', type=bool, default=False, help='Wrap the sparse refiner with a bf16 autocast scope (only effective when --precision mixed_bf16; default is fp32 for the refiner)')
-@click.option('--precision', type=click.Choice(['fp32', 'tf32', 'mixed_bf16']), default='fp32', help='Numerical precision to use')
-@click.option('--enable_ema', type=bool, default=True, help='Maintain an exponential moving average of the model weights')
-@click.option('--debug', 'debug_mode', type=bool, default=False, help='Enable debug mode')
+@click.option('--config', 'config_path', type=str, default='configs/train/v3.json')
+@click.option('--name', 'experiment_name', type=str, default='MoGe-3', help='Experiment name')
+@click.option('--workspace', 'workspace_path', type=str, default='workspace/moge3', help='Workspace for logs, visualizations and checkpoints')
+@click.option('--initial_checkpoint', type=str, default='', help='Initial checkpoint used when the workspace has no requested checkpoint')
+@click.option('--checkpoint', 'checkpoint_path', type=str, default='latest', help='Checkpoint path, step number, "latest", or "none"')
+@click.option('--batch_size_forward', type=int, default=8, help='Batch size for each forward pass on each device')
+@click.option('--gradient_accumulation_steps', type=int, default=1, help='Number of steps to accumulate gradients')
+@click.option('--enable_gradient_checkpointing', type=bool, default=True, help='Use gradient checkpointing in the backbone')
+@click.option('--precision', type=click.Choice(['fp32', 'mixed_bf16']), default='mixed_bf16', help='Numerical precision')
+@click.option('--enable_ema', type=bool, default=True, help='Maintain an exponential moving average of model weights')
+@click.option('--debug', 'debug_mode', type=bool, default=False, help='Enable additional debug dumps')
 @click.option('--num_iterations', type=int, default=1000000, help='Number of iterations to train the model')
-@click.option('--checkpoint_every', type=int, default=5000, help='Save permanent checkpoint every n iterations')
-@click.option('--rolling_checkpoint_every', type=int, default=500, help='Save rolling checkpoint every n iterations (only keeps the latest)')
+@click.option('--checkpoint_every', type=int, default=10000, help='Save a permanent checkpoint every n iterations')
+@click.option('--rolling_checkpoint_every', type=int, default=500, help='Save a rolling checkpoint every n iterations')
 @click.option('--log_every', type=int, default=1000, help='Log metrics every n iterations')
 @click.option('--vis_every', type=int, default=0, help='Visualize every n iterations')
 @click.option('--vis_gt', type=bool, default=True, help='Visualize ground truth')
-@click.option('--num_vis_images', type=int, default=32, help='Number of images to visualize, must be a multiple of divided batch size')
-@click.option('--log_type', type=click.Choice(['mlflow', 'tensorboard', 'wandb']), multiple=True, default=('tensorboard',), help='log type to use (can specify multiple)')
-@click.option('--log_dir', type=str, default=None, help='Root directory for tensorboard logs')
-@click.option('--gc_every', type=int, default=1000, help='Run garbage collection every n iterations to reduce memory usage')
-@click.option('--seed', type=int, default=0, help='Random seed')
+@click.option('--num_vis_images', type=int, default=32, help='Number of images to visualize')
+@click.option('--log_type', type=click.Choice(['mlflow', 'tensorboard', 'wandb']), multiple=True, default=(), help='Logging backend; may be specified more than once')
+@click.option('--tb_log_root', type=str, default=None, help='Root directory for TensorBoard logs. Logs will be stored in a subdirectory named after the experiment.')
 @click.option('--wandb_project', type=str, default='MoGe', help='Weights & Biases project name')
-@click.option('--max_invalid_batches', type=int, default=-1, help='Maximum number of all-invalid batches before abort; set to -1 to disable this check')
-@click.option('--find_unused_parameters', type=bool, default=True, help='Whether to set find_unused_parameters=True for DistributedDataParallel, which may be necessary if not all model parameters receive gradients in each iteration')
-@click.option('--num_load_workers', type=int, default=4, help='Number of workers for loading data')
-@click.option('--num_process_workers', type=int, default=8, help='Number of workers for processing data')
+@click.option('--gc_every', type=int, default=1000, help='Run garbage collection every n iterations')
+@click.option('--seed', type=int, default=0, help='Random seed')
+@click.option('--find_unused_parameters', type=bool, default=True, help='Whether DDP should look for unused parameters')
 def main(
     config_path: str,
     experiment_name: str,
     workspace_path: str,
-    base_checkpoint: Optional[str],
+    initial_checkpoint: str,
     checkpoint_path: str,
     batch_size_forward: int,
     gradient_accumulation_steps: int,
-    backbone_gradient_checkpoint: bool,
-    refiner_gradient_checkpoint: bool,
-    refiner_bf16: bool,
+    enable_gradient_checkpointing: bool,
     precision: str,
     enable_ema: bool,
     debug_mode: bool,
@@ -114,30 +126,30 @@ def main(
     vis_gt: bool,
     num_vis_images: int,
     log_type: Tuple[str, ...],
-    log_dir: Optional[str],
+    tb_log_root: Optional[str],
     gc_every: int,
-    seed: Optional[int],
+    seed: int,
     wandb_project: str,
-    max_invalid_batches: int,
     find_unused_parameters: bool,
-    num_load_workers: int,
-    num_process_workers: int,
 ):
     # Load config
     with open(config_path, 'r') as f:
         config = json.load(f)
+    if config['model_version'] != 'v3':
+        raise ValueError(f"train_moge3_refiner.py is only compatible with model_version 'v3', got {config['model_version']}")
     refine_ratio = config['refine_ratio']
     monitor_pairs = refine_step_pairs(config['refine_steps'])
     if not 0.0 <= refine_ratio <= 1.0:
         raise ValueError(f"config['refine_ratio'] must be in [0, 1], got {refine_ratio}")
 
+    # Init
     accelerator, device, batch_size_total, workspace = setup_accelerator(
         gradient_accumulation_steps, find_unused_parameters, batch_size_forward, workspace_path,
     )
     logger = RunLogger(accelerator, log_type)
     logger.setup(
         workspace=workspace, config=config, experiment_name=experiment_name,
-        log_dir=log_dir, wandb_project=wandb_project, batch_size_total=batch_size_total,
+        tb_log_root=tb_log_root, wandb_project=wandb_project, batch_size_total=batch_size_total,
         extra_params={'refine_ratio': refine_ratio},
     )
 
@@ -151,51 +163,34 @@ def main(
         from moge.model import import_model_class_by_version
         MoGeModel = import_model_class_by_version(config['model_version'])      
         model = MoGeModel(**config['model'])
-    count_total_parameters = sum(p.numel() for p in model.parameters())
-    print(f'Total parameters: {count_total_parameters}')
+    print(f'Total parameters: {sum(p.numel() for p in model.parameters())}')
 
     # Set up EMA model
     if enable_ema and accelerator.is_main_process:
-        ema_avg_fn = lambda averaged_model_parameter, model_parameter, num_averaged: 0.999 * averaged_model_parameter + 0.001 * model_parameter
+        ema_avg_fn = lambda averaged, current, _: 0.999 * averaged + 0.001 * current
         ema_model = torch.optim.swa_utils.AveragedModel(model, device=accelerator.device, avg_fn=ema_avg_fn)
 
     # Set gradient checkpointing
-    if backbone_gradient_checkpoint:
+    if enable_gradient_checkpointing:
         model.enable_gradient_checkpointing()
-    if refiner_gradient_checkpoint:
-        model.refiner.enable_gradient_checkpointing()
 
     # Set precision
-    if precision == 'fp32':
-        pass
-    elif precision == 'tf32':
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.allow_tf32 = False
-    elif precision == 'mixed_bf16':
+    if precision == 'mixed_bf16':
         model.enable_mixed_precision()
-    if refiner_bf16:
-        model.refiner.enable_mixed_precision(torch.bfloat16)
-        if precision != 'mixed_bf16':
-            print(f"Warning: --refiner_bf16 is set but --precision is '{precision}'")
 
     # Initalize optimizer & lr scheduler
     optimizer = build_optimizer(model, config['optimizer'])
     lr_scheduler = build_lr_scheduler(optimizer, config['lr_scheduler'])
-
     count_grouped_parameters = [sum(p.numel() for p in param_group['params'] if p.requires_grad) for param_group in optimizer.param_groups]
     for i, count in enumerate(count_grouped_parameters):
         print(f'- Group {i}: {count} parameters')
     if accelerator.is_main_process:
-        write_optimizer_param_assignment_log(
-            model,
-            optimizer,
-            workspace,
-        )
+        write_optimizer_param_assignment_log(model, optimizer, workspace)
 
-    # Attempt to load checkpoint; fall back to the base checkpoint when the workspace has none.
+    # Attempt to load checkpoint; fall back to the init checkpoint when the workspace has none.
     checkpoint = load_checkpoint(checkpoint_path, workspace, accelerator, enable_ema)
     if checkpoint is None:
-        checkpoint = load_checkpoint(base_checkpoint, workspace, accelerator, enable_ema)
+        checkpoint = load_checkpoint(initial_checkpoint, workspace, accelerator, enable_ema)
     initial_step = restore_training_state(
         checkpoint, model, optimizer, lr_scheduler, ema_model if enable_ema and accelerator.is_main_process else None,
         accelerator, enable_ema,
@@ -208,28 +203,26 @@ def main(
         from moge.model.utils import sync_ddp_hook
         model.register_comm_hook(None, sync_ddp_hook)
 
-    def get_refine_accumulation_schedule(step: int) -> List[bool]:
-        start_quota = math.floor(step * gradient_accumulation_steps * refine_ratio + 1e-9)
-        end_quota = math.floor((step + 1) * gradient_accumulation_steps * refine_ratio + 1e-9)
-        num_refine_accumulations = end_quota - start_quota
-        if num_refine_accumulations <= 0:
-            return [False] * gradient_accumulation_steps
-        if num_refine_accumulations >= gradient_accumulation_steps:
-            return [True] * gradient_accumulation_steps
-        num_norefine_accumulations = gradient_accumulation_steps - num_refine_accumulations
-        return [i >= num_norefine_accumulations for i in range(gradient_accumulation_steps)]
-
     # Initialize training data pipelines
-    dataloader_seed = (seed + accelerator.process_index) if seed is not None else None
+    dataloader_seed = seed + accelerator.process_index
     with accelerator.local_main_process_first():
-        refine_data_pipeline = TrainDataLoaderPipeline(deepcopy(config['refine_data']), batch_size_forward, workspace=workspace, num_load_workers=num_load_workers, num_process_workers=num_process_workers, seed=dataloader_seed)
-        norefine_data_pipeline = TrainDataLoaderPipeline(deepcopy(config['norefine_data']), batch_size_forward, workspace=workspace, num_load_workers=num_load_workers, num_process_workers=num_process_workers, seed=dataloader_seed)
+        refine_data_pipeline = TrainDataLoaderPipeline(deepcopy(config['refine_data']),
+            batch_size_forward,
+            workspace=workspace,
+            seed=dataloader_seed
+        )
+        norefine_data_pipeline = TrainDataLoaderPipeline(
+            deepcopy(config['norefine_data']),
+            batch_size_forward,
+            workspace=workspace,
+            seed=dataloader_seed
+        )
 
     # Restore data pipeline RNG state if resuming
     data_pipelines = {'refine': refine_data_pipeline, 'norefine': norefine_data_pipeline}
     restore_data_pipeline_states(workspace, initial_step, accelerator, data_pipelines)
 
-    records = []
+    records: List[Dict[str, Any]] = []
     ma_buffer = restore_ma_buffer(workspace, initial_step, accelerator)
 
     model.train()
@@ -241,17 +234,18 @@ def main(
         ThreadPoolExecutor(max_workers=1) as save_checkpoint_executor,
     ):
         checkpoint_saver = CheckpointSaver(
-            workspace=workspace, config=config, accelerator=accelerator, model=model,
+            workspace=workspace,config=config, accelerator=accelerator, model=model,
             optimizer=optimizer, lr_scheduler=lr_scheduler,
             ema_model=ema_model if enable_ema and accelerator.is_main_process else None,
             enable_ema=enable_ema, ma_buffer=ma_buffer, executor=save_checkpoint_executor,
             pbar=pbar, num_iterations=num_iterations, checkpoint_every=checkpoint_every,
             rolling_checkpoint_every=rolling_checkpoint_every, initial_step=initial_step,
         )
+
         # Get some batches for visualization
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and vis_every > 0:
             batches_for_vis: List[Dict[str, torch.Tensor]] = []
-            num_vis_images = num_vis_images // 2 * 2 // batch_size_forward * batch_size_forward
+            num_vis_images = num_vis_images // batch_size_forward * batch_size_forward
             num_vis_batches = num_vis_images // batch_size_forward
             for _ in range(num_vis_batches // 2):
                 batch = norefine_data_pipeline.get()
@@ -264,17 +258,17 @@ def main(
         if vis_every > 0 and accelerator.is_main_process and vis_gt:
             visualize_gt(batches_for_vis, workspace, batch_size_forward, initial_step, logger)
 
-        # Reset seed to avoid training on the same data when resuming training
         if seed is not None:
-            set_seed(seed + initial_step, device_specific=True)   
+            set_seed(seed + initial_step, device_specific=True)
 
         # Tags starting with 'nan_' are fatal and count toward the abort threshold; others
         # (e.g. large_grad_norm_*) are informational and capped to avoid filling disk.
         dumper = DebugDumper(
             workspace, accelerator,
-            dump_grad_norm_above=config.get('dump_grad_norm_above', 10),
+            dump_grad_norm_above=config.get('dump_grad_norm_above', 10 if debug_mode else None),
         )
-        invalid_batch_encountered_times = 0
+
+        # Trackers and logs for refiner training monitoring.
         loss_decrease_tracker: Dict[Tuple, List[int]] = {}
         loss_decrease_log: Dict[str, float] = {}
         delta_increase_tracker: Dict[Tuple, List[int]] = {}
@@ -285,29 +279,27 @@ def main(
         # Training loop
         for i_step in range(initial_step, num_iterations):
             with timeit('Step', verbose=False) as timer_step:
-                step_record_start = len(records)
-                refine_accumulation_schedule = get_refine_accumulation_schedule(i_step)
+                refine_accumulation_schedule = get_refine_accumulation_schedule(
+                    i_step, gradient_accumulation_steps, refine_ratio,
+                )
                 for i_accumulate in range(gradient_accumulation_steps):
                     use_refine_pipeline = refine_accumulation_schedule[i_accumulate]
                     active_data_pipeline = refine_data_pipeline if use_refine_pipeline else norefine_data_pipeline
+                    refine_steps = config['refine_steps'] if use_refine_pipeline else 0
                     # Load batch
-                    with timeit('Load instance', verbose=False) as timer_load_instance:
-                        batch = active_data_pipeline.get()
-                        batch = to_device(batch, device)
-                    records.append({'time/data': timer_load_instance.time})
-
-                    is_invalid_batch = False
+                    with timeit('Load instance', verbose=False) as timer_load:
+                        batch = to_device(active_data_pipeline.get(), device)
+                    records.append({'time/data': timer_load.time})
 
                     image, gt_depth, gt_normal, gt_mask_fin, gt_mask_inf, gt_intrinsics, label_type, is_metric, info = batch['image'], batch['depth'], batch['normal'], batch['depth_mask_fin'], batch['depth_mask_inf'], batch['intrinsics'], batch['label_type'], batch['is_metric'], batch['info']
-
                     current_batch_size = image.shape[0]
 
-                    if all(label == 'invalid' for label in label_type):
-                        is_invalid_batch = True
-                        print(f"Rank {accelerator.process_index} all-invalid batch at step {i_step}, accumulation {i_accumulate}. Batch info: {info}")
-                        invalid_batch_encountered_times += 1
-                    
-                    refine_steps = config['refine_steps'] if use_refine_pipeline else 0
+                    is_invalid_batch = all(label == 'invalid' for label in label_type)
+                    if is_invalid_batch:
+                        pbar.write(
+                            f'Rank {accelerator.process_index} all-invalid batch at step {i_step}, '
+                            f'accumulation {i_accumulate}. Batch info: {info}'
+                        )
 
                     gt_points = utils3d.pt.depth_map_to_point_map(gt_depth, intrinsics=gt_intrinsics)
                     gt_focal = 1 / (1 / gt_intrinsics[..., 0, 0] ** 2 + 1 / gt_intrinsics[..., 1, 1] ** 2) ** 0.5
@@ -328,10 +320,11 @@ def main(
                                 refiner_detach_backbone=_detach_backbone,
                                 return_per_step=True,
                             )
+                        records.append({'time/forward': timer_forward.time})
                         pred_points_all = output.get('points_per_step', None)
                         pred_normal, pred_mask, pred_metric_scale = (output.get(k, None) for k in ['normal', 'mask', 'metric_scale'])
 
-                        # Compute loss (per instance)
+                        # Compute loss
                         with timeit('Loss computation', verbose=False) as timer_loss_computation:
                             if is_invalid_batch:
                                 loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -491,10 +484,12 @@ def main(
 
                                 loss = sum(loss_list) / len(loss_list)  # Average over the batch
                             records.append({'train/loss': to_log_scalar(loss)})
+                        records.append({'time/loss': timer_loss_computation.time})
 
                         # Backward
                         with timeit('Backward', verbose=False) as timer_backward:
                             accelerator.backward(loss)
+                        records.append({'time/backward': timer_backward.time})
 
                         # Optimizer step
                         if accelerator.sync_gradients:
@@ -518,38 +513,29 @@ def main(
                         dumper.flush(i_step, i_accumulate, batch, output)
 
             records.append({'time/step': timer_step.time})
-
             lr_scheduler.step()
 
             # EMA update            
             if enable_ema and accelerator.is_main_process and accelerator.sync_gradients:
                 ema_model.update_parameters(model)
 
-            # Print raw loss values and refine loss regression stats every 100 steps
-            if accelerator.is_main_process and i_step % 100 == 0:
-                step_avg = key_average(materialize_log_records(records[step_record_start:]))
-                loss_misc = {k: v for k, v in sorted(step_avg.items()) if k.startswith(('loss/',))}
-                if loss_misc:
-                    pbar.write(f'[Step {i_step}] ' + ' | '.join(f'{k}: {v:.6f}' for k, v in loss_misc.items()))
-                if 'train/loss' in step_avg:
-                    pbar.set_postfix({'loss': step_avg['train/loss']}, refresh=False)
-            
-                if i_step != initial_step:
-                    write_refine_monitor_table(
-                        pbar, i_step, loss_decrease_tracker, loss_decrease_log,
-                        title='Refine loss decrease% monitor (bigger=better):',
-                        label='loss', log_prefix='loss_decrease', pairs=monitor_pairs, invert=True,
-                    )
-                    write_refine_monitor_table(
-                        pbar, i_step, delta_increase_tracker, delta_increase_log,
-                        title='Misc delta increase% monitor (bigger=better):',
-                        label='metric', log_prefix='delta_increase', pairs=monitor_pairs,
-                    )
-                    write_refine_monitor_table(
-                        pbar, i_step, error_decrease_tracker, error_decrease_log,
-                        title='Misc error decrease% monitor (bigger=better):',
-                        label='metric', log_prefix='error_decrease', pairs=monitor_pairs,
-                    )
+            # Print refine loss regression stats every 100 steps
+            if accelerator.is_main_process and i_step % 100 == 0 and i_step != initial_step:
+                write_refine_monitor_table(
+                    pbar, i_step, loss_decrease_tracker, loss_decrease_log,
+                    title='Refine loss decrease% monitor (bigger=better):',
+                    label='loss', log_prefix='loss_decrease', pairs=monitor_pairs, invert=True,
+                )
+                write_refine_monitor_table(
+                    pbar, i_step, delta_increase_tracker, delta_increase_log,
+                    title='Misc delta increase% monitor (bigger=better):',
+                    label='metric', log_prefix='delta_increase', pairs=monitor_pairs,
+                )
+                write_refine_monitor_table(
+                    pbar, i_step, error_decrease_tracker, error_decrease_log,
+                    title='Misc error decrease% monitor (bigger=better):',
+                    label='metric', log_prefix='error_decrease', pairs=monitor_pairs,
+                )
 
             # Log metrics
             if log_every > 0 and i_step != initial_step and i_step % log_every == 0:
@@ -561,54 +547,31 @@ def main(
                     records, ma_buffer, lr_scheduler, i_step, initial_step, extra_scalars=_extra_scalars,
                 )
 
-            checkpoint_saver.save_if_due(i_step)
-
-            # Save data pipeline RNG state for all processes so data order can be resumed
-            if checkpoint_saver.is_due(i_step):
+            # Save checkpoint
+            due = checkpoint_saver.save_if_due(i_step)
+            if due:
                 save_data_pipeline_states(workspace, i_step, accelerator, data_pipelines)
 
+            # Print data pipeline profile every 100 steps
             if accelerator.is_main_process and i_step > 0 and i_step % 100 == 0:
                 pbar.write(f'[Step {i_step}] refine data pipeline profile:\n{refine_data_pipeline.profile()}')
                 pbar.write(f'[Step {i_step}] norefine data pipeline profile:\n{norefine_data_pipeline.profile()}')
 
-            checkpoint_saver.poll_on_demand(i_step)
-
-            if max_invalid_batches >= 0:
-                invalid_batch_abort_flag = torch.tensor(
-                    [int(invalid_batch_encountered_times > max_invalid_batches)],
-                    device=device,
-                    dtype=torch.int32,
-                )
-                gathered_invalid_batch_abort_flags = accelerator.gather(invalid_batch_abort_flag)
-                if gathered_invalid_batch_abort_flags.max().item() > 0:
-                    if accelerator.is_main_process:
-                        triggered_ranks = [
-                            i for i, flag in enumerate(gathered_invalid_batch_abort_flags.tolist()) if flag > 0
-                        ]
-                        pbar.write(f'Invalid batch threshold {max_invalid_batches} reached on ranks {triggered_ranks}, saving checkpoint before abort.')
-                        checkpoint_saver.save(i_step, async_save=False)
-                    accelerator.wait_for_everyone()
-                    raise RuntimeError('Encountered too many invalid batches on at least one rank, abort training.')
-
             # Visualize
-            if vis_every > 0 and accelerator.is_main_process and (i_step == initial_step or i_step % vis_every == 0 or i_step == num_iterations - 1):
+            if (
+                vis_every > 0
+                and accelerator.is_main_process
+                and (i_step == initial_step or i_step % vis_every == 0 or i_step == num_iterations - 1)
+            ):
                 visualize_predictions(
                     batches_for_vis, model, accelerator, workspace, device,
                     batch_size_forward, i_step, refine_steps=config['refine_steps'], logger=logger,
                 )
+
             pbar.update(1)
 
-            if accelerator.is_main_process and (i_step % 10 == 0):
-                autotune_cache_path = Path.home() / '.flex_gemm' / 'autotune_cache.json'
-                if autotune_cache_path.exists():
-                    try:
-                        shutil.copy(autotune_cache_path, Path(workspace, f'autotune_cache.json'))
-                    except Exception as e:
-                        pbar.write(f'Error copying autotune cache: {e}')
-                        traceback.print_exc()
-
             # Garbage collection to reduce peak memory
-            if gc_every > 0 and (i_step % gc_every == 0) and (i_step != initial_step):
+            if gc_every > 0 and i_step % gc_every == 0 and i_step != initial_step:
                 gc.collect()
                 torch.cuda.empty_cache()
 
