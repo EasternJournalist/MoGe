@@ -264,7 +264,6 @@
     "low_resolution_training_steps": 0,
     "refine_steps": 3,
     "refine_ratio": 0.5,
-    "loss_weight_balance": "mean",
     "refiner_detach_backbone_until": 5001,
     "loss": {
         "invalid": {},
