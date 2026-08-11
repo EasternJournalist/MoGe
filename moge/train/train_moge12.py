@@ -58,6 +58,10 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.utils.ch
 torch._dynamo.config.disable = True
 torch.backends.cudnn.benchmark = False      # Varying input size, make sure cudnn benchmark is disabled
 
+# The cuDNN attention backend on H100 sm90 has a bug that occasionally causes NaN gradients.
+if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
 
 @click.command()
 @click.option('--config', 'config_path', type=str, default='configs/train/v2.json')
