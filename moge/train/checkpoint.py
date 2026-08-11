@@ -31,6 +31,8 @@ def load_checkpoint(
             pass
         elif ckpt_path.endswith('.pt'):
             # - Load specific checkpoint file
+            if not Path(ckpt_path).exists():
+                raise FileNotFoundError(f'Requested checkpoint file does not exist: {ckpt_path}')
             print(f'Load checkpoint: {ckpt_path}')
             checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         elif ckpt_path == 'latest':
@@ -39,11 +41,26 @@ def load_checkpoint(
             if latest_path.exists():
                 print(f'Load checkpoint: {latest_path}')
                 checkpoint = torch.load(latest_path, map_location='cpu', weights_only=True)
-                checkpoint = _hydrate_shards(checkpoint, checkpoint['step'], workspace, accelerator, enable_ema)
-        elif ckpt_path.isdigit():
-            # - Load by step number
-            i_step = int(ckpt_path)
-            checkpoint = _hydrate_shards({'step': i_step}, i_step, workspace, accelerator, enable_ema)
+                # `ckpt_name` is the shard basename. Pointers written before it existed carry the
+                # name in `step` instead, where it is the string 'final' for a completed run.
+                ckpt_name = checkpoint.get('ckpt_name', checkpoint.get('step'))
+                checkpoint = _hydrate_shards(checkpoint, ckpt_name, workspace, accelerator, enable_ema)
+        elif ckpt_path.isdigit() or ckpt_path == 'final':
+            # - Load by step number, or by the 'final' name a completed run writes
+            i_step = int(ckpt_path) if ckpt_path.isdigit() else 'final'
+            ckpt_name = f'{i_step:08d}' if isinstance(i_step, int) else i_step
+            if Path(workspace, 'checkpoint', f'{ckpt_name}.pt').exists():
+                checkpoint = _hydrate_shards({'step': i_step}, i_step, workspace, accelerator, enable_ema)
+            else:
+                # Returning None rather than a shard-less dict is what lets the caller fall back
+                # to `--initial_checkpoint`, as that option's help text promises. Hydrating here
+                # would instead hand back `{'step': N}` and hard-fail in restore_training_state.
+                print(f"Warning: no checkpoint named '{ckpt_name}.pt' under {Path(workspace, 'checkpoint')}")
+        else:
+            raise ValueError(
+                f'Unrecognized checkpoint specifier {ckpt_path!r}; expected a path ending in .pt, '
+                "'latest', 'final', 'none', or a step number"
+            )
     return checkpoint
 
 
@@ -103,12 +120,20 @@ def restore_training_state(
     with accelerator.local_main_process_first():
         model.init_weights()
     model.load_state_dict(checkpoint['model'], strict=False)
-    if 'step' in checkpoint:
-        initial_step = checkpoint['step'] + 1
+    step = checkpoint.get('step')
+    if isinstance(step, int):
+        initial_step = step + 1
         print(f'Resume from step {initial_step}')
-    else:
+    elif step is None:
         initial_step = 0
         print('No step info found in checkpoint, start from step 0')
+    else:
+        # `latest.pt` pointers written before `ckpt_name` existed store the string 'final' here,
+        # and the real step number only arrives with the optimizer shard. When that shard is
+        # missing there is no step to resume from, so start over instead of crashing on
+        # `'final' + 1`.
+        initial_step = 0
+        print(f'Warning: checkpoint step is {step!r}, not a step number; start from step 0')
     if 'optimizer' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer'])
     else:
@@ -273,8 +298,10 @@ class CheckpointSaver:
                 'model': self.ema_model.module.state_dict(),
                 'ema_n_averaged': int(self.ema_model.n_averaged),
             }, async_save)
-        latest_step = 'final' if ckpt_name == 'final' else i_step
-        self._write('latest.pt', {'model_config': model_config, 'step': latest_step}, async_save)
+        # `step` stays an int so a resume can always derive the next step without depending on
+        # the optimizer shard; `ckpt_name` carries the shard basename, which is 'final' for the
+        # last iteration and `{step:08d}` otherwise.
+        self._write('latest.pt', {'model_config': model_config, 'step': i_step, 'ckpt_name': ckpt_name}, async_save)
         self._write('latest_ma_buffer.pt', {'step': i_step, 'ma_buffer': list(self.ma_buffer)}, async_save)
 
     def is_due(self, i_step: int) -> bool:
@@ -282,18 +309,23 @@ class CheckpointSaver:
         return self._classify(i_step)[0]
 
     def _classify(self, i_step: int) -> Tuple[bool, bool]:
+        is_final = (i_step == self.num_iterations - 1)
         is_permanent = (
             self.checkpoint_every > 0
             and i_step % self.checkpoint_every == 0
             and i_step != self.initial_step
         )
+        # A final step is saved under the name 'final', not '{step:08d}', so it must never be
+        # tracked as rolling: the manifest entry would name files that were never written, the
+        # 'final' shards would leak, and a later cleanup would delete an identically-numbered
+        # checkpoint that some other run legitimately wrote into this workspace.
         is_rolling = (
             self.rolling_checkpoint_every > 0
             and i_step % self.rolling_checkpoint_every == 0
             and i_step != self.initial_step
             and not is_permanent
+            and not is_final
         )
-        is_final = (i_step == self.num_iterations - 1)
         return is_permanent or is_rolling or is_final, is_rolling
 
     def save_if_due(self, i_step: int) -> bool:

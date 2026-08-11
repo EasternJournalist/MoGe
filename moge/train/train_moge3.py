@@ -137,6 +137,8 @@ def main(
         config = json.load(f)
     if config['model_version'] != 'v3':
         raise ValueError(f"train_moge3_refiner.py is only compatible with model_version 'v3', got {config['model_version']}")
+    if gradient_accumulation_steps < 1:
+        raise ValueError(f'--gradient_accumulation_steps must be at least 1, got {gradient_accumulation_steps}')
     refine_ratio = config['refine_ratio']
     monitor_pairs = refine_step_pairs(config['refine_steps'])
     if not 0.0 <= refine_ratio <= 1.0:
@@ -243,10 +245,17 @@ def main(
         )
 
         # Get some batches for visualization
+        batches_for_vis: List[Dict[str, torch.Tensor]] = []
         if accelerator.is_main_process and vis_every > 0:
-            batches_for_vis: List[Dict[str, torch.Tensor]] = []
-            num_vis_images = num_vis_images // batch_size_forward * batch_size_forward
-            num_vis_batches = num_vis_images // batch_size_forward
+            # Visualisation works in whole forward batches. Rounding down to zero would leave
+            # --vis_every silently creating empty directories for the rest of the run, so keep
+            # at least one batch.
+            num_vis_batches = max(1, num_vis_images // batch_size_forward)
+            if num_vis_batches * batch_size_forward != num_vis_images:
+                pbar.write(
+                    f'num_vis_images={num_vis_images} is not a multiple of batch_size_forward='
+                    f'{batch_size_forward}; visualizing {num_vis_batches * batch_size_forward} images instead'
+                )
             for _ in range(num_vis_batches // 2):
                 batch = norefine_data_pipeline.get()
                 batches_for_vis.append(batch)
@@ -404,25 +413,39 @@ def main(
                                                     gt_points_i,
                                                     mask_i,
                                                 )
+                                            else:
+                                                raise ValueError(f"Undefined points loss function: {v['function']}")
 
                                     # normal
                                     for k, v in config['loss'][label_type[i]].get('normal', {}).items():
                                         weight_dict[k] = v['weight']
                                         if v['function'] == 'normal_map_loss':
-                                            loss_dict[k], misc_dict[k] = normal_map_loss(pred_normal[i], gt_normal[i])
-                                    
+                                            loss_dict[k], misc_dict[k] = normal_map_loss(
+                                                pred_normal[i], gt_normal[i], **v.get('params', {}),
+                                            )
+                                        else:
+                                            raise ValueError(f"Undefined normal loss function: {v['function']}")
+
                                     # mask
                                     for k, v in config['loss'][label_type[i]].get('mask', {}).items():
                                         weight_dict[k] = v['weight']
                                         if v['function'] == 'mask_bce_loss':
-                                            loss_dict[k], misc_dict[k] = mask_bce_loss(pred_mask[i], gt_mask_fin[i], gt_mask_inf[i])
+                                            loss_dict[k], misc_dict[k] = mask_bce_loss(
+                                                pred_mask[i], gt_mask_fin[i], gt_mask_inf[i], **v.get('params', {}),
+                                            )
+                                        else:
+                                            raise ValueError(f"Undefined mask loss function: {v['function']}")
 
                                     # metric_scale
                                     for k, v in config['loss'][label_type[i]].get('metric_scale', {}).items():
                                         weight_dict[k] = v['weight']
                                         if v['function'] == 'metric_scale_loss':
                                             if is_metric[i] and pred_metric_scale is not None and step0_gt_metric_scale is not None:
-                                                loss_dict[k], misc_dict[k] = metric_scale_loss(pred_metric_scale[i], step0_gt_metric_scale.detach())
+                                                loss_dict[k], misc_dict[k] = metric_scale_loss(
+                                                    pred_metric_scale[i], step0_gt_metric_scale.detach(), **v.get('params', {}),
+                                                )
+                                        else:
+                                            raise ValueError(f"Undefined metric_scale loss function: {v['function']}")
 
                                     weight_dict = {'.'.join(k): v for k, v in flatten_nested_dict(weight_dict).items()}
                                     loss_dict = {'.'.join(k): v for k, v in flatten_nested_dict(loss_dict).items()}
@@ -538,14 +561,20 @@ def main(
                 )
 
             # Log metrics
-            if log_every > 0 and i_step != initial_step and i_step % log_every == 0:
-                _extra_scalars = {}
-                for _log in (loss_decrease_log, delta_increase_log, error_decrease_log):
-                    _extra_scalars.update(_log)
-                    _log.clear()
-                records = logger.log_metrics(
-                    records, ma_buffer, lr_scheduler, i_step, initial_step, extra_scalars=_extra_scalars,
-                )
+            if log_every > 0:
+                if i_step == initial_step or i_step % log_every == 0:
+                    _extra_scalars = {}
+                    for _log in (loss_decrease_log, delta_increase_log, error_decrease_log):
+                        _extra_scalars.update(_log)
+                        _log.clear()
+                    records = logger.log_metrics(
+                        records, ma_buffer, lr_scheduler, i_step, initial_step, extra_scalars=_extra_scalars,
+                    )
+            else:
+                # Logging disabled. `records` is only ever drained by `log_metrics`, and every
+                # entry holds live CUDA scalars, so it has to be dropped here or it grows without
+                # bound for the whole run.
+                records = []
 
             # Save checkpoint
             due = checkpoint_saver.save_if_due(i_step)

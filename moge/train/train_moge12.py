@@ -113,6 +113,8 @@ def main(
     # Load config
     with open(config_path, 'r') as f:
         config = json.load(f)
+    if gradient_accumulation_steps < 1:
+        raise ValueError(f'--gradient_accumulation_steps must be at least 1, got {gradient_accumulation_steps}')
 
     # Init
     accelerator, device, batch_size_total, workspace = setup_accelerator(
@@ -212,9 +214,16 @@ def main(
         # Get some batches for visualization
         batches_for_vis: List[Dict[str, torch.Tensor]] = []
         if accelerator.is_main_process and vis_every > 0:
-            num_vis_images = num_vis_images // batch_size_forward * batch_size_forward
-            num_vis_batches = num_vis_images // batch_size_forward
-            batches_for_vis = [train_data_pipe.get() for _ in range(num_vis_images // batch_size_forward)]
+            # Visualisation works in whole forward batches. Rounding down to zero would leave
+            # --vis_every silently creating empty directories for the rest of the run, so keep
+            # at least one batch.
+            num_vis_batches = max(1, num_vis_images // batch_size_forward)
+            if num_vis_batches * batch_size_forward != num_vis_images:
+                pbar.write(
+                    f'num_vis_images={num_vis_images} is not a multiple of batch_size_forward='
+                    f'{batch_size_forward}; visualizing {num_vis_batches * batch_size_forward} images instead'
+                )
+            batches_for_vis = [train_data_pipe.get() for _ in range(num_vis_batches)]
             if vis_gt:
                 visualize_gt(batches_for_vis, workspace, batch_size_forward, initial_step, logger)
 
@@ -411,8 +420,14 @@ def main(
             if enable_ema and accelerator.is_main_process and accelerator.sync_gradients:
                 ema_model.update_parameters(model)
 
-            if log_every > 0 and (i_step == initial_step or i_step % log_every == 0):
-                records = logger.log_metrics(records, ma_buffer, lr_scheduler, i_step, initial_step)
+            if log_every > 0:
+                if i_step == initial_step or i_step % log_every == 0:
+                    records = logger.log_metrics(records, ma_buffer, lr_scheduler, i_step, initial_step)
+            else:
+                # Logging disabled. `records` is only ever drained by `log_metrics`, and every
+                # entry holds live CUDA scalars, so it has to be dropped here or it grows without
+                # bound for the whole run.
+                records = []
 
             # Save checkpoint
             due = checkpoint_saver.save_if_due(i_step)

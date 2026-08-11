@@ -178,13 +178,15 @@ class RunLogger:
                     prefix, rest = k.split('/', 1)
                     records[f'ma1000_{prefix}/{rest}'] = sum(values) / len(values)
 
+            # Label each LR curve by its optimizer param-group name rather than by position, so a
+            # config that reorders `optimizer.params` cannot silently mislabel the curves.
             last_lrs = lr_scheduler.get_last_lr()
+            optimizer = getattr(lr_scheduler, 'optimizer', None)
+            group_names = [g.get('name') for g in optimizer.param_groups] if optimizer is not None else []
             records['train/lr'] = last_lrs[0]
-            if len(last_lrs) > 2:
-                records['train/lr_refiner'] = last_lrs[1]
-                records['train/lr_backbone'] = last_lrs[2]
-            elif len(last_lrs) > 1:
-                records['train/lr_backbone'] = last_lrs[1]
+            for idx, lr in enumerate(last_lrs):
+                name = group_names[idx] if idx < len(group_names) and group_names[idx] else f'group{idx}'
+                records[f'train/lr_{name}'] = lr
 
             if extra_scalars:
                 records.update(extra_scalars)
