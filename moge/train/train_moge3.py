@@ -273,8 +273,9 @@ def main(
         # Tags starting with 'nan_' are fatal and count toward the abort threshold; others
         # (e.g. large_grad_norm_*) are informational and capped to avoid filling disk.
         dumper = DebugDumper(
-            workspace, accelerator,
+            workspace, accelerator, model,
             dump_grad_norm_above=config.get('dump_grad_norm_above', 10 if debug_mode else None),
+            save_model_on_first_dump=config.get('debug_save_model_on_first_dump', False),
         )
 
         # Trackers and logs for refiner training monitoring.
@@ -288,6 +289,7 @@ def main(
         # Training loop
         for i_step in range(initial_step, num_iterations):
             with timeit('Step', verbose=False) as timer_step:
+                dumper.begin_step()
                 refine_accumulation_schedule = get_refine_accumulation_schedule(
                     i_step, gradient_accumulation_steps, refine_ratio,
                 )
@@ -514,6 +516,11 @@ def main(
                             accelerator.backward(loss)
                         records.append({'time/backward': timer_backward.time})
 
+                        # Attribute a non-finite gradient to the micro-batch that introduced it.
+                        # Before the sync micro-step nothing has been all-reduced, so this pins
+                        # the culprit to this rank and this batch.
+                        dumper.check_grads(i_accumulate, synced=accelerator.sync_gradients)
+
                         # Optimizer step
                         if accelerator.sync_gradients:
                             # Clip grad norm
@@ -526,14 +533,23 @@ def main(
                             else:
                                 pbar.write(f'Non-finite gradient norm {grad_norm} encountered in process {accelerator.process_index}, skip optimizer step.')
                                 pbar.write(f'Batch info: {info}')
-                                dumper.add_reason('nan_grad_norm')
+                                if not dumper.grads_flagged:
+                                    # Defensive: `check_grads` screens the same quantity and
+                                    # should already own this, so landing here means they
+                                    # disagreed. Never lose the event.
+                                    dumper.add_reason('nan_grad_norm_unattributed')
 
                             # Extra dump trigger: large grad norm.
                             dumper.note_grad_norm(grad_norm, grad_norm_is_finite)
 
                         optimizer.zero_grad()
 
-                        dumper.flush(i_step, i_accumulate, batch, output)
+                        dumper.flush(i_step, i_accumulate, batch, output, meta={
+                            'num_tokens': num_tokens,
+                            'refine_steps': refine_steps,
+                            'use_refine_pipeline': use_refine_pipeline,
+                            'refiner_detach_backbone': _detach_backbone,
+                        })
 
             records.append({'time/step': timer_step.time})
             lr_scheduler.step()
