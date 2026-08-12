@@ -400,6 +400,87 @@ def align_points_xyz_shift(points_src: torch.Tensor, points_tgt: torch.Tensor, w
     return shift
 
 
+def align_depth_shift_with_scale(
+    depth_src: torch.Tensor,
+    depth_tgt: torch.Tensor,
+    weight: torch.Tensor,
+    scale: Union[float, torch.Tensor],
+    max_iters: int = 5,
+    eps: float = 1e-6,
+    tol: float = 1e-9,
+) -> torch.Tensor:
+    """
+    With a known scalar `scale` `s`, solve for a scalar shift `t` minimizing
+        sum_i w_i * (1 / (s * depth_src_i + t) - 1 / depth_tgt_i) ^ 2
+    via Gauss-Newton iteration.
+
+    Operates on a single 1-D batch (no leading batch dims).
+
+    ### Parameters:
+    - `depth_src: torch.Tensor` of shape (N,)
+    - `depth_tgt: torch.Tensor` of shape (N,), assumed strictly positive.
+    - `weight: torch.Tensor` of shape (N,)
+    - `scale: float` or 0-d tensor
+
+    ### Returns:
+    - `shift: torch.Tensor` 0-d tensor.
+    """
+    p_scaled = depth_src * scale
+    inv_g = 1.0 / depth_tgt
+    w = weight
+
+    t = torch.zeros((), dtype=p_scaled.dtype, device=p_scaled.device)
+    p_min = p_scaled.min().detach()
+
+    for _ in range(max_iters):
+        t_min = (-p_min + eps).item()
+        if t.item() <= t_min:
+            t = torch.tensor(t_min, dtype=t.dtype, device=t.device)
+        q = p_scaled + t
+        r = 1.0 / q - inv_g
+        # Gauss-Newton on residual r_i(t) = 1/(s*p_i + t) - 1/g_i, dr/dt = -1/q^2.
+        # grad = 2 sum w * r * (-1/q^2);  hess_GN = 2 sum w * (1/q^2)^2 = 2 sum w / q^4 > 0.
+        grad = -2.0 * (w * r / q.pow(2)).sum()
+        hess = 2.0 * (w / q.pow(4)).sum()
+        if hess.abs() < 1e-12:
+            break
+        step = grad / hess
+        new_t = t - step
+        if new_t.item() <= t_min:
+            new_t = torch.tensor(t_min, dtype=t.dtype, device=t.device)
+        if (new_t - t).abs() < tol:
+            t = new_t
+            break
+        t = new_t
+
+    return t
+
+
+def align_points_xyz_shift_with_scale(
+    points_src: torch.Tensor,
+    points_tgt: torch.Tensor,
+    weight: torch.Tensor,
+    scale: Union[float, torch.Tensor],
+    trunc: Optional[Union[float, torch.Tensor]] = None,
+) -> torch.Tensor:
+    """
+    With a known scalar `scale` `s`, solve for a 3-vector shift `t` minimizing
+        sum_i w_i * || s * points_src_i + t - points_tgt_i || ^ 2 (truncated).
+
+    ### Parameters:
+    - `points_src: torch.Tensor` of shape (..., N, 3)
+    - `points_tgt: torch.Tensor` of shape (..., N, 3)
+    - `weight: torch.Tensor` of shape (..., N)
+    - `scale: float` or tensor broadcastable to (...)
+
+    ### Returns:
+    - `shift: torch.Tensor` of shape (..., 3)
+    """
+    if isinstance(scale, torch.Tensor) and scale.ndim > 0:
+        scale = scale[..., None, None]
+    return align_points_xyz_shift(points_src * scale, points_tgt, weight, trunc=trunc)
+
+
 def align_affine_lstsq(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Solve `min sum_i w_i * (a * x_i + b - y_i ) ^ 2`, where `a` and `b` are scalars, with respect to `a` and `b` using least squares.

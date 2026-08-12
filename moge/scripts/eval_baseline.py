@@ -17,10 +17,11 @@ import click
     'Defaults to "configs/eval/all_benchmarks.json".')
 @click.option('--output', '-o', 'output_path',  type=click.Path(), required=True, help='Path to the output json file.')
 @click.option('--oracle', 'oracle_mode', is_flag=True, help='Use oracle mode for evaluation, i.e., use the GT intrinsics input.')
+@click.option('--mg', 'mg', type=str, default='moge3', help='Comma-separated metric groups to compute.')
 @click.option('--dump_pred', is_flag=True, help='Dump predition results.')
 @click.option('--dump_gt', is_flag=True, help='Dump ground truth.')
 @click.pass_context
-def main(ctx: click.Context, baseline_code_path: str, config_path: str, oracle_mode: bool, output_path: Union[str, Path], dump_pred: bool, dump_gt: bool):
+def main(ctx: click.Context, baseline_code_path: str, config_path: str, oracle_mode: bool, mg: Optional[str], output_path: Union[str, Path], dump_pred: bool, dump_gt: bool):
     # Lazy import
     import  cv2
     import numpy as np
@@ -74,7 +75,7 @@ def main(ctx: click.Context, baseline_code_path: str, config_path: str, oracle_m
                     torch.cuda.synchronize()
 
                 # Compute metrics
-                metrics, misc = compute_metrics(pred, sample, vis=dump_pred or dump_gt)
+                metrics, misc = compute_metrics(pred, sample, vis=dump_pred or dump_gt, mg=mg)
                 metrics['inference_time'] = timer.time
                 metrics_list.append(metrics)
 
