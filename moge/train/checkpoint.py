@@ -163,7 +163,7 @@ def restore_training_state(
 
 
 def restore_ma_buffer(workspace: Path, initial_step: int, accelerator) -> deque:
-    """Restore the moving-average buffer so ma1000/avg1000 curves stay continuous on resume."""
+    """Restore the moving-average buffer so ma1000 curves stay continuous on resume."""
     ma_buffer = deque(maxlen=MA_BUFFER_MAXLEN)
     if initial_step > 0 and accelerator.is_main_process:
         path = Path(workspace, 'checkpoint', 'latest_ma_buffer.pt')
@@ -172,7 +172,7 @@ def restore_ma_buffer(workspace: Path, initial_step: int, accelerator) -> deque:
             ma_buffer = deque(state.get('ma_buffer', []), maxlen=MA_BUFFER_MAXLEN)
             print(f"Restored ma_buffer ({len(ma_buffer)} entries) from step {state.get('step', '?')}")
         else:
-            print('Warning: No ma_buffer state found, ma1000/avg1000 metrics will restart from the beginning')
+            print('Warning: No ma_buffer state found, ma1000 metrics will restart from the beginning')
     return ma_buffer
 
 

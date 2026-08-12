@@ -191,13 +191,5 @@ class RunLogger:
             if extra_scalars:
                 records.update(extra_scalars)
 
-            # avg1000 every 1000 steps, reusing ma_buffer.
-            if i_step % 1000 == 0 and i_step != initial_step and ma_buffer:
-                for k in key_average(list(ma_buffer)):
-                    values = filter_outliers([d[k] for d in ma_buffer if k in d])
-                    if values:
-                        prefix, rest = k.split('/', 1)
-                        records[f'avg1000_{prefix}/{rest}'] = sum(values) / len(values)
-
             self._upload(records, i_step)
         return []
