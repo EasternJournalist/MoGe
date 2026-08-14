@@ -75,6 +75,9 @@ For example,
 # Evaluate MoGe-3 on the 10 benchmarks with 3 refine steps
 python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --pretrained PATH_TO_CKPT.pt --resolution_level 9 --version v3 --refine_steps 3
 
+# Same as the first one, but spread over 4 GPUs (see "Multi-GPU Evaluation" below)
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --ngpu 4 --pretrained PATH_TO_CKPT.pt --resolution_level 9 --version v3 --refine_steps 3
+
 # Evaluate MoGe on the 10 benchmarks
 python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge2.json --output eval_output/moge.json --pretrained Ruicheng/moge-vitl --resolution_level 9
 
@@ -88,7 +91,7 @@ python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config confi
 python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --mg moge2 --pretrained PATH_TO_CKPT.pt --version v3
 ```
 
-The `--baselies` `--input` `--output` arguments are for the inference script. The rest arguments, e.g. `--pretrained` `--resolution_level`, are custormized for loading the baseline model.
+The `--baseline` `--input` `--output` arguments are for the inference script. The rest arguments, e.g. `--pretrained` `--resolution_level`, are custormized for loading the baseline model.
 
 Details of the arguments:
 
@@ -98,16 +101,29 @@ Usage: eval_baseline.py [OPTIONS]
   Evaluation script.
 
 Options:
-  --baseline PATH    Path to the baseline model python code.  [required]
-  --config PATH      Path to the evaluation configurations. Defaults to
-                     "configs/eval/all_benchmarks.json".
-  -o, --output PATH  Path to the output json file.  [required]
-  --oracle           Use oracle mode for evaluation, i.e., use the GT
-                     intrinsics input.
-  --mg TEXT          Comma-separated metric groups to compute.
-  --dump_pred        Dump predition results.
-  --dump_gt          Dump ground truth.
-  --help             Show this message and exit.
+  --baseline PATH       Path to the baseline model python code.  [required]
+  --config PATH         Path to the evaluation configurations. Defaults to
+                        "configs/eval/all_benchmarks.json".
+  -o, --output PATH     Path to the output json file.  [required]
+  --ngpu INTEGER RANGE  Number of GPUs to use. Whole benchmarks of the config
+                        are distributed across the GPUs round-robin, one
+                        process per GPU. Defaults to 1, i.e. a single in-
+                        process run.  [x>=1]
+  --oracle              Use oracle mode for evaluation, i.e., use the GT
+                        intrinsics input.
+  --mg TEXT             Comma-separated metric groups to compute.
+  --dump_pred           Dump predition results.
+  --dump_gt             Dump ground truth.
+  --help                Show this message and exit.
+```
+
+
+## Multi-GPU Evaluation
+
+`--ngpu N` spawns one worker process per GPU and hands each worker whole benchmarks of the config. The `i`-th benchmark goes to worker `i % N`. 
+
+```bash
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --ngpu 4 --pretrained PATH_TO_CKPT.pt --version v3
 ```
 
 
