@@ -21,7 +21,7 @@ unzip '*.zip'
 
 ## Configuration
 
-See [`configs/eval/all_benchmarks.json`](../configs/eval/all_benchmarks.json) for an example of evaluation configurations on all benchmarks. You can modify this file to evaluate on different benchmarks or different baselines.
+See [`configs/eval/moge3.json`](../configs/eval/moge3.json) for an example of evaluation configurations on all benchmarks. You can modify this file to evaluate on different benchmarks or different baselines.
 
 Each entry maps a benchmark name to a config object. Supported keys:
 
@@ -73,19 +73,19 @@ For example,
 
 ```bash
 # Evaluate MoGe-3 on the 10 benchmarks with 3 refine steps
-python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --pretrained PATH_TO_CKPT.pt --resolution_level 9 --version v3 --refine_steps 3
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --pretrained PATH_TO_CKPT.pt --resolution_level 9 --version v3 --refine_steps 3
 
 # Evaluate MoGe on the 10 benchmarks
-python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --pretrained Ruicheng/moge-vitl --resolution_level 9
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge2.json --output eval_output/moge.json --pretrained Ruicheng/moge-vitl --resolution_level 9
 
 # Evaluate Depth Anything V2 on the 10 benchmarks. (NOTE: affine disparity)
-python moge/scripts/eval_baseline.py --baseline baselines/da_v2.py --config configs/eval/all_benchmarks.json --output eval_output/da_v2.json
+python moge/scripts/eval_baseline.py --baseline baselines/da_v2.py --config configs/eval/moge2.json --output eval_output/da_v2.json
 
 # Only global metrics, skipping the expensive local and boundary ones
-python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --mg global --pretrained PATH_TO_CKPT.pt --version v3
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --mg global --pretrained PATH_TO_CKPT.pt --version v3
 
 # The metric set of MoGe-2, for comparison against older results
-python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/all_benchmarks.json --output eval_output/moge.json --mg moge2 --pretrained PATH_TO_CKPT.pt --version v3
+python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --mg moge2 --pretrained PATH_TO_CKPT.pt --version v3
 ```
 
 The `--baselies` `--input` `--output` arguments are for the inference script. The rest arguments, e.g. `--pretrained` `--resolution_level`, are custormized for loading the baseline model.
