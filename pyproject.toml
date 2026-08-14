@@ -62,7 +62,7 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
-# PTo target a different CUDA version, either change the index URL above, 
+# To target a different CUDA version, either change the index URL above, 
 # or reinstall into the synced environment with
 # `uv pip install --torch-backend=cu128 torch torchvision --reinstall`.
 [tool.uv.sources]
