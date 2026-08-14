@@ -407,7 +407,6 @@ def align_depth_shift_with_scale(
     scale: Union[float, torch.Tensor],
     max_iters: int = 5,
     eps: float = 1e-6,
-    tol: float = 1e-9,
 ) -> torch.Tensor:
     """
     With a known scalar `scale` `s`, solve for a scalar shift `t` minimizing
@@ -429,29 +428,22 @@ def align_depth_shift_with_scale(
     inv_g = 1.0 / depth_tgt
     w = weight
 
-    t = torch.zeros((), dtype=p_scaled.dtype, device=p_scaled.device)
-    p_min = p_scaled.min().detach()
+    # `t` is lower-bounded so that `s * depth_src + t` stays strictly positive. The
+    # bound does not change across iterations, so it is pulled to the host once
+    t_min = (-p_scaled.min().detach() + eps).item()
+    t = torch.full((), max(0.0, t_min), dtype=p_scaled.dtype, device=p_scaled.device)
 
     for _ in range(max_iters):
-        t_min = (-p_min + eps).item()
-        if t.item() <= t_min:
-            t = torch.tensor(t_min, dtype=t.dtype, device=t.device)
         q = p_scaled + t
         r = 1.0 / q - inv_g
         # Gauss-Newton on residual r_i(t) = 1/(s*p_i + t) - 1/g_i, dr/dt = -1/q^2.
-        # grad = 2 sum w * r * (-1/q^2);  hess_GN = 2 sum w * (1/q^2)^2 = 2 sum w / q^4 > 0.
+        # grad = 2 sum w * r * (-1/q^2);  hess_GN = 2 sum w * (1/q^2)^2 = 2 sum w / q^4 >= 0.
         grad = -2.0 * (w * r / q.pow(2)).sum()
         hess = 2.0 * (w / q.pow(4)).sum()
-        if hess.abs() < 1e-12:
-            break
-        step = grad / hess
-        new_t = t - step
-        if new_t.item() <= t_min:
-            new_t = torch.tensor(t_min, dtype=t.dtype, device=t.device)
-        if (new_t - t).abs() < tol:
-            t = new_t
-            break
-        t = new_t
+        # A degenerate Hessian (e.g. all-zero weights) would give a nan/inf step;
+        # freeze `t` in that case rather than breaking out, to keep the loop sync-free.
+        step = torch.where(hess > 1e-12, grad / hess.clamp_min(1e-12), torch.zeros_like(grad))
+        t = torch.clamp(t - step, min=t_min)
 
     return t
 

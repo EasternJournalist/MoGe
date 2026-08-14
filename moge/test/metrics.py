@@ -110,8 +110,8 @@ def boundary_f1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, radius
         pred_label = pred_rel > 1 + t
         gt_label = gt_rel > 1 + t
         TP = (pred_label & gt_label & valid).float().sum()
-        precision = TP / (gt_label & valid).float().sum().clamp_min(1e-12)
-        recall = TP / (pred_label & valid).float().sum().clamp_min(1e-12)
+        precision = TP / (pred_label & valid).float().sum().clamp_min(1e-12)
+        recall = TP / (gt_label & valid).float().sum().clamp_min(1e-12)
         f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-12)
         f1_list.append(f1.item())
 
@@ -274,24 +274,28 @@ def compute_metrics(
 
     #### Required keys in gt:
         - `depth`: depth map ground truth (in metric units if `depth_metric` is used)
+        - `depth_mask`: mask indicating valid pixels in the ground-truth depth.
         - `points`: point map ground truth in camera coordinates.
-        - `mask`: mask indicating valid pixels in the ground truth.
         - `intrinsics`: normalized ground-truth camera intrinsics matrix.
         - `is_metric`: whether the depth is in metric units.
+        - `has_sharp_boundary`: whether the ground truth resolves depth discontinuities
+          sharply enough for the boundary groups to be meaningful.
+
+    #### Optional keys in gt (the groups that need them are skipped if absent):
+        - `normal`, `normal_mask`: normal map ground truth and its valid mask, for `normal`.
+        - `segmentation_mask`, `segmentation_labels`: per-object segment id map and its
+          `{name: id}` table, for `points_local_moge2`.
+        - `local_mask`, `local_segmentation`: high-frequency region mask and the segment id
+          map within it, for `depth_local` / `points_local`.
 
     #### Special flags:
         - `is_ppd`: if True, treat `pred['depth_affine_invariant']` as Pixel-Perfect Depth's
           raw output, which is affine-invariant in log-depth space
           (`pred ≈ a * log(depth + 1) + b`). The affine alignment is then performed
           in log-depth space to match PPD's official evaluator.
-    #### Metric groups:
-        - Two named suites: `moge3` (the default) and `moge2`, which reproduces
-          the metric set reported by the pre-MoGe-3 evaluator.
-        - Building-block categories: `global`, `metric`, `local`, `boundary`.
-        - Categories and concrete groups can be mixed in a comma-separated
-          string, e.g. `global,local` or `moge3,normal` or `moge2,moge3`.
+
     """
-    mg = resolve_metric_groups(mg)
+    mg = frozenset(resolve_metric_groups(mg))
 
     metrics = {}
     misc = {}
@@ -354,7 +358,6 @@ def compute_metrics(
         # Metric depth
         if gt['is_metric'] and 'depth_metric' in pred:
             pred_depth = pred['depth_metric']
-            gt_depth = gt['depth']
             metrics['depth_metric'] = depth_metrics_dict(pred_depth[mask], gt_depth[mask])
 
             metric_depth_aligned = pred_depth
@@ -566,7 +569,7 @@ def compute_metrics(
     # result insensitive to the global scale/shift error the other groups measure.
     #
     # Segments come from `local_segmentation` (full SAM segment id map, >0 per id).
-    if 'local_mask' in gt and gt['local_mask'] is not None:
+    if ('depth_local' in mg or 'points_local' in mg) and gt.get('local_mask', None) is not None:
         hf_mask = gt['local_mask'] & mask
         if gt.get('local_segmentation', None) is not None:
             hf_seg = gt['local_segmentation'].to(torch.long)
@@ -576,36 +579,53 @@ def compute_metrics(
         else:
             hf_labels = hf_mask.to(torch.long)
 
-        seg_ids = torch.unique(hf_labels[hf_mask])
-        seg_ids = seg_ids[seg_ids > 0].tolist()
         min_seg_pixels = 10
         # Cap the number of points used for per-segment alignment to avoid OOM in
         # `align_depth_shift_with_scale` / `align_points_xyz_shift_with_scale` (which
-        # build O(N) or O(N^2) intermediates). Use a fixed-seed RNG so the subsampling
-        # is deterministic across runs.
+        # build O(N) or O(N^2) intermediates).
         max_align_pts = 4096
-        align_rng = torch.Generator(device=hf_mask.device).manual_seed(0)
 
-        def _subsample_idx(n: int) -> Optional[torch.Tensor]:
+        # Group the high-frequency pixels by segment id once and share the result
+        # between the depth and points groups. Sorting the flat pixel indices by label
+        # makes every segment a contiguous slice, so scoring one costs O(segment)
+        # instead of an O(H*W) mask comparison, and the sizes reach the host in a
+        # single sync instead of one per segment per group. The sort must be stable:
+        # `_subsample_idx` picks pixels by position, so a run-to-run reshuffle within
+        # a segment would make the subsample non-deterministic.
+        pixel_index = hf_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        pixel_label = hf_labels.reshape(-1)[pixel_index]
+        order = torch.argsort(pixel_label, stable=True)
+        pixel_index, pixel_label = pixel_index[order], pixel_label[order]
+        seg_id, seg_count = torch.unique_consecutive(pixel_label, return_counts=True)
+        seg_start = torch.cumsum(seg_count, dim=0) - seg_count
+        segments = [
+            (sid, start, count)
+            for sid, start, count in zip(seg_id.tolist(), seg_start.tolist(), seg_count.tolist())
+            if sid > 0 and count >= min_seg_pixels
+        ]
+
+        def _subsample_idx(n: int, sid: int) -> Optional[torch.Tensor]:
             if n <= max_align_pts:
                 return None
-            return torch.randperm(n, generator=align_rng, device=hf_mask.device)[:max_align_pts]
+            # Seed per segment id rather than sharing one generator across the loop:
+            # a shared stream would make a segment's subsample depend on how many
+            # segments — and which metric groups — were processed before it, so
+            # `--mg points_local` and `--mg moge3` would disagree on the same image.
+            rng = torch.Generator(device=pixel_index.device).manual_seed(sid)
+            return torch.randperm(n, generator=rng, device=pixel_index.device)[:max_align_pts]
 
         def _average_over_segments(score_segment: Callable[..., Dict[str, Number]]) -> Optional[Dict[str, Number]]:
-            """Apply `score_segment(seg_mask, fit_idx)` to every high-frequency segment
+            """Apply `score_segment(seg_index, fit_idx)` to every high-frequency segment
             and average the per-segment metric dicts unweighted.
 
-            `fit_idx` subsamples the segment's pixels for the alignment fit only; the
-            metrics themselves are always computed over the full segment. Returns None
-            if no segment was large enough to score.
+            `seg_index` indexes the flattened image; `fit_idx` subsamples it for the
+            alignment fit only, as the metrics themselves are always computed over the
+            full segment. Returns None if no segment was large enough to score.
             """
-            per_seg = []
-            for sid in seg_ids:
-                seg_mask = (hf_labels == sid) & hf_mask
-                n = seg_mask.sum().item()
-                if n < min_seg_pixels:
-                    continue
-                per_seg.append(score_segment(seg_mask, _subsample_idx(n)))
+            per_seg = [
+                score_segment(pixel_index[start:start + count], _subsample_idx(count, sid))
+                for sid, start, count in segments
+            ]
             return key_average(per_seg) if per_seg else None
 
         # ---- depth ----
@@ -614,10 +634,13 @@ def compute_metrics(
             and pred_depth_scale_invariant is not None
             and global_depth_scale is not None
         ):
-            def _score_depth(seg_mask: torch.Tensor, sub: Optional[torch.Tensor]) -> Dict[str, Number]:
+            pred_depth_flat = pred_depth_scale_invariant.reshape(-1).detach()
+            gt_depth_flat = gt_depth.reshape(-1).detach()
+
+            def _score_depth(seg_index: torch.Tensor, sub: Optional[torch.Tensor]) -> Dict[str, Number]:
                 # Per-segment scalar shift only; share the globally-fitted scale.
-                p = pred_depth_scale_invariant[seg_mask].detach()
-                g = gt_depth[seg_mask].detach()
+                p = pred_depth_flat[seg_index]
+                g = gt_depth_flat[seg_index]
                 p_fit = p if sub is None else p[sub]
                 g_fit = g if sub is None else g[sub]
                 t = align_depth_shift_with_scale(p_fit, g_fit, 1 / g_fit, global_depth_scale)
@@ -637,10 +660,13 @@ def compute_metrics(
             and pred_points_scale_invariant is not None
             and global_points_scale is not None
         ):
-            def _score_points(seg_mask: torch.Tensor, sub: Optional[torch.Tensor]) -> Dict[str, Number]:
+            pred_points_flat = pred_points_scale_invariant.reshape(-1, 3).detach()
+            gt_points_flat = gt_points.reshape(-1, 3).detach()
+
+            def _score_points(seg_index: torch.Tensor, sub: Optional[torch.Tensor]) -> Dict[str, Number]:
                 # Per-segment xyz shift only; share the globally-fitted scale.
-                p = pred_points_scale_invariant[seg_mask].detach()
-                g = gt_points[seg_mask].detach()
+                p = pred_points_flat[seg_index]
+                g = gt_points_flat[seg_index]
                 w = 1 / g.norm(dim=-1).clamp_min(1e-6)
                 p_fit = p if sub is None else p[sub]
                 g_fit = g if sub is None else g[sub]
