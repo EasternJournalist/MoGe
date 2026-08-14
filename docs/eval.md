@@ -106,9 +106,9 @@ Options:
                         "configs/eval/all_benchmarks.json".
   -o, --output PATH     Path to the output json file.  [required]
   --ngpu INTEGER RANGE  Number of GPUs to use. Whole benchmarks of the config
-                        are distributed across the GPUs round-robin, one
-                        process per GPU. Defaults to 1, i.e. a single in-
-                        process run.  [x>=1]
+                        are distributed over one worker process per GPU, each
+                        claiming the next benchmark as it goes. Defaults to 1,
+                        i.e. a single in-process run.  [x>=1]
   --oracle              Use oracle mode for evaluation, i.e., use the GT
                         intrinsics input.
   --mg TEXT             Comma-separated metric groups to compute.
@@ -120,7 +120,7 @@ Options:
 
 ## Multi-GPU Evaluation
 
-`--ngpu N` spawns one worker process per GPU and hands each worker whole benchmarks of the config. The `i`-th benchmark goes to worker `i % N`. 
+`--ngpu N` spawns one worker process per GPU and hands each worker whole benchmarks of the config. Whoever finishes first takes the next unclaimed benchmark, so the GPUs stay busy despite the benchmarks being very unevenly sized.
 
 ```bash
 python moge/scripts/eval_baseline.py --baseline baselines/moge.py --config configs/eval/moge3.json --output eval_output/moge.json --ngpu 4 --pretrained PATH_TO_CKPT.pt --version v3

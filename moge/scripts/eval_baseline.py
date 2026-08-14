@@ -22,7 +22,7 @@ def _load_baseline(baseline_code_path: str, extra_args: Sequence[str]) -> 'MGEBa
 
 def _evaluate_benchmarks(
     baseline: 'MGEBaselineInterface',
-    benchmarks: Sequence[Tuple[str, Dict[str, Any]]],
+    benchmarks: Iterable[Tuple[str, Dict[str, Any]]],
     *,
     metrics_output_path: Union[str, Path],
     dump_dir: Union[str, Path],
@@ -51,14 +51,15 @@ def _evaluate_benchmarks(
     from moge.utils.tools import key_average, timeit
 
     all_metrics = {}
+    # A worker claims its benchmarks one at a time, so only the single-process path knows the total upfront.
+    if tqdm_position is None:
+        benchmarks = tqdm(list(benchmarks), desc='Benchmarks')
     # Iterate over the dataset
-    for benchmark_index, (benchmark_name, benchmark_config) in enumerate(tqdm(list(benchmarks), desc='Benchmarks', disable=tqdm_position is not None)):
+    for benchmark_name, benchmark_config in benchmarks:
         metrics_list = []
-        # In multi-GPU mode the outer bar is disabled, so fold its progress into the inner bar's description.
-        pbar_desc = benchmark_name if tqdm_position is None else f'{tqdm_prefix}{benchmark_name} [{benchmark_index + 1}/{len(benchmarks)}]'
         with (
             EvalDataLoaderPipeline(**benchmark_config) as eval_data_pipe,
-            tqdm(total=len(eval_data_pipe), desc=pbar_desc, position=tqdm_position, leave=False) as pbar
+            tqdm(total=len(eval_data_pipe), desc=f'{tqdm_prefix}{benchmark_name}', position=tqdm_position, leave=False) as pbar
         ):
             # Iterate over the samples in the dataset
             for i in range(len(eval_data_pipe)):
@@ -191,12 +192,30 @@ def _partial_output_path(output_path: Union[str, Path], rank: int) -> Path:
     return path.with_name(f'{path.stem}.rank{rank}{path.suffix or ".json"}')
 
 
+def _claim_benchmarks(benchmarks: Sequence[Tuple[str, Dict[str, Any]]], counter) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield benchmarks claimed one at a time from a counter shared by all workers.
+
+    Whoever finishes first takes the next benchmark, so the workers stay busy no matter how unevenly
+    the benchmarks are sized. A plain shared counter is used rather than a queue because a queue's
+    feeder thread may not have flushed yet when a worker first polls it, which would make that worker
+    give up before any work is visible.
+    """
+    while True:
+        with counter.get_lock():
+            index = counter.value
+            counter.value += 1
+        if index >= len(benchmarks):
+            return
+        yield benchmarks[index]
+
+
 def _worker_entry(
     rank: int,
     device: str,
     baseline_code_path: str,
     extra_args: List[str],
     benchmarks: List[Tuple[str, Dict[str, Any]]],
+    counter,
     partial_output_path: str,
     dump_dir: str,
     oracle_mode: bool,
@@ -218,7 +237,7 @@ def _worker_entry(
 
         baseline = _load_baseline(baseline_code_path, extra_args)
         all_metrics = _evaluate_benchmarks(
-            baseline, benchmarks,
+            baseline, _claim_benchmarks(benchmarks, counter),
             metrics_output_path=partial_output_path,
             dump_dir=dump_dir,
             oracle_mode=oracle_mode,
@@ -228,7 +247,8 @@ def _worker_entry(
             tqdm_position=rank,
             tqdm_prefix=f'[gpu {device}] ',
         )
-        # Written explicitly instead of relying on the intermediate save, which never fires for an empty benchmark.
+        # Written explicitly instead of relying on the intermediate save, which never fires for a worker
+        # that ends up claiming nothing.
         Path(partial_output_path).write_text(json.dumps(all_metrics, indent=4))
     except KeyboardInterrupt:
         sys.exit(130)
@@ -252,7 +272,7 @@ def _run_multi_gpu(
     dump_pred: bool,
     dump_gt: bool,
 ) -> Dict[str, Any]:
-    """Distribute whole benchmarks over `ngpu` worker processes and merge their results."""
+    """Distribute the benchmarks over `ngpu` worker processes and merge their results."""
     import multiprocessing as mp
 
     devices = _resolve_visible_devices(ngpu)
@@ -261,8 +281,6 @@ def _run_multi_gpu(
         click.echo(f'Note: the config has only {len(benchmarks)} benchmark(s); using {num_workers} of the {ngpu} requested GPUs.', err=True)
     devices = devices[:num_workers]
 
-    # Per-dataset round-robin: the i-th benchmark of the config goes to worker `i % num_workers`.
-    shards = [list(benchmarks[rank::num_workers]) for rank in range(num_workers)]
     partial_paths = [_partial_output_path(output_path, rank) for rank in range(num_workers)]
     for path in partial_paths:
         path.unlink(missing_ok=True)    # never merge a leftover file from a previous run
@@ -271,13 +289,14 @@ def _run_multi_gpu(
     # executed statement is ours, which is what makes the CUDA_VISIBLE_DEVICES pinning above possible.
     ctx = mp.get_context('spawn')
     tqdm_lock = ctx.RLock()
+    counter = ctx.Value('i', 0)     # index of the next benchmark to be claimed; see `_claim_benchmarks`
     processes = []
     try:
         for rank in range(num_workers):
             process = ctx.Process(
                 target=_worker_entry,
                 args=(
-                    rank, devices[rank], baseline_code_path, list(extra_args), shards[rank],
+                    rank, devices[rank], baseline_code_path, list(extra_args), list(benchmarks), counter,
                     str(partial_paths[rank]), str(dump_dir), oracle_mode, mg, dump_pred, dump_gt, tqdm_lock,
                 ),
                 name=f'eval-rank{rank}-gpu{devices[rank]}',
@@ -298,27 +317,27 @@ def _run_multi_gpu(
                 process.kill()
         print('\n' * num_workers, file=sys.stderr, end='')      # move the cursor below the pinned progress bars
 
-    # Collect the per-rank results, treating a crashed or truncated worker as a hard failure.
+    # Collect the per-rank results, treating a crashed worker as a hard failure.
     all_metrics, failures = {}, []
-    for rank, (process, shard, partial_path) in enumerate(zip(processes, shards, partial_paths)):
+    for rank, (process, partial_path) in enumerate(zip(processes, partial_paths)):
         if process.exitcode != 0:
-            failures.append((rank, f'exited with code {process.exitcode}'))
+            failures.append(f'rank {rank} (CUDA_VISIBLE_DEVICES={devices[rank]}) exited with code {process.exitcode}')
             continue
         if not partial_path.exists():
-            failures.append((rank, f'produced no result file at {partial_path}'))
+            failures.append(f'rank {rank} (CUDA_VISIBLE_DEVICES={devices[rank]}) produced no result file at {partial_path}')
             continue
-        metrics = json.loads(partial_path.read_text())
-        # A worker that died mid-benchmark leaves a valid but incomplete intermediate snapshot behind.
-        if missing := sorted({name for name, _ in shard} - set(metrics)):
-            failures.append((rank, f'produced an incomplete result, missing {missing}'))
-            continue
-        all_metrics.update(metrics)
+        all_metrics.update(json.loads(partial_path.read_text()))
+
+    # Which benchmarks a worker claims is only decided at run time, so completeness is checked globally.
+    # This also catches a worker that died in the middle of a benchmark, leaving a valid but truncated snapshot.
+    if missing := [benchmark_name for benchmark_name, _ in benchmarks if benchmark_name not in all_metrics]:
+        failures.append(f'no result was produced for {missing}')
 
     if failures:
         kept = [path for path in partial_paths if path.exists()]
         raise click.ClickException(
-            f'{len(failures)} of {num_workers} eval worker(s) failed:\n'
-            + '\n'.join(f'  rank {rank} (CUDA_VISIBLE_DEVICES={devices[rank]}): {reason}' for rank, reason in failures)
+            'the multi-GPU evaluation did not complete:\n'
+            + '\n'.join(f'  {failure}' for failure in failures)
             + f'\n{output_path} was not written.'
             + (
                 '\nThe per-rank partial results are kept for inspection:\n' + '\n'.join(f'  {path}' for path in kept)
@@ -337,7 +356,7 @@ def _run_multi_gpu(
     'Defaults to "configs/eval/all_benchmarks.json".')
 @click.option('--output', '-o', 'output_path',  type=click.Path(), required=True, help='Path to the output json file.')
 @click.option('--ngpu', 'ngpu', type=click.IntRange(min=1), default=1, help='Number of GPUs to use. Whole benchmarks of the config are '
-    'distributed across the GPUs round-robin, one process per GPU. Defaults to 1, i.e. a single in-process run.')
+    'distributed over one worker process per GPU, each claiming the next benchmark as it goes. Defaults to 1, i.e. a single in-process run.')
 @click.option('--oracle', 'oracle_mode', is_flag=True, help='Use oracle mode for evaluation, i.e., use the GT intrinsics input.')
 @click.option('--mg', 'mg', type=str, default='moge3', help='Comma-separated metric groups to compute.')
 @click.option('--dump_pred', is_flag=True, help='Dump predition results.')
@@ -380,7 +399,7 @@ def main(ctx: click.Context, baseline_code_path: str, config_path: str, ngpu: in
             ngpu, baseline_code_path, ctx.args, benchmarks, output_path, dump_dir,
             oracle_mode, mg, dump_pred, dump_gt,
         )
-        # Restore the config order, which the round-robin sharding scrambled.
+        # Restore the config order, which depends on which worker happened to claim what.
         all_metrics = {benchmark_name: per_benchmark_metrics[benchmark_name] for benchmark_name, _ in benchmarks}
 
     # Save final results
