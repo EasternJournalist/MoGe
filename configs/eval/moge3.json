@@ -62,8 +62,7 @@
         "split": ".index.txt",
         "depth_unit": 1.0,
         "local_mask": "local_mask.png",
-        "local_segmentation": "sam_segmentation.png",
-        "has_sharp_boundary": true
+        "local_segmentation": "sam_segmentation.png"
     },
     "HAMMER": {
         "path": "data/eval/HAMMER",
